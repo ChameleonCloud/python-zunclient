@@ -225,6 +225,13 @@ class CreateContainer(command.ShowOne):
             metavar='<entrypoint>',
             help='The entrypoint which overwrites the default ENTRYPOINT '
                  'of the image.')
+        parser.add_argument(
+            '--device-profile',
+            action='append',
+            default=[],
+            metavar='<device_profile>',
+            help='Specify a device profile to request along with the container.'
+        )
         return parser
 
     def take_action(self, parsed_args):
@@ -258,6 +265,8 @@ class CreateContainer(command.ShowOne):
             opts['interactive'] = True
         if parsed_args.privileged:
             opts['privileged'] = True
+        if parsed_args.device_profile:
+            opts['device_profiles'] = parsed_args.device_profile
         opts['hints'] = zun_utils.format_args(parsed_args.hint)
         opts['nets'] = zun_utils.parse_nets(parsed_args.net)
         opts['mounts'] = zun_utils.parse_mounts(parsed_args.mount)
@@ -930,6 +939,13 @@ class RunContainer(command.ShowOne):
             metavar='<entrypoint>',
             help='The entrypoint which overwrites the default ENTRYPOINT '
                  'of the image.')
+        parser.add_argument(
+            '--device-profile',
+            action='append',
+            default=[],
+            metavar='<device_profile>',
+            help='Specify a device profile to request along with the container.'
+        )
         return parser
 
     def take_action(self, parsed_args):
@@ -963,6 +979,8 @@ class RunContainer(command.ShowOne):
             opts['interactive'] = True
         if parsed_args.privileged:
             opts['privileged'] = True
+        if parsed_args.device_profile:
+            opts['device_profiles'] = parsed_args.device_profile
         opts['hints'] = zun_utils.format_args(parsed_args.hint)
         opts['nets'] = zun_utils.parse_nets(parsed_args.net)
         opts['mounts'] = zun_utils.parse_mounts(parsed_args.mount)
