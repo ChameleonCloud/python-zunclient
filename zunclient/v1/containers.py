@@ -200,6 +200,7 @@ class ContainerManager(base.Manager):
                             qparams=kwargs)[1]
 
     def execute(self, id, **kwargs):
+        self._process_execute_tty(kwargs)
         return self._action(id, '/execute',
                             qparams=kwargs)[1]
 
@@ -263,6 +264,12 @@ class ContainerManager(base.Manager):
         # execution when the websocket connects.
         response = self.execute(id, command=command, run=False)
         return k8s_exec.connect(response['proxy_url'])
+
+    def _process_execute_tty(self, kwargs):
+        tty_microversion = api_versions.APIVersion("1.42")
+        if self.api_version >= tty_microversion:
+            if 'interactive' in kwargs and 'tty' not in kwargs:
+                kwargs['tty'] = kwargs['interactive']
 
     def execute_resize(self, id, exec_id, width, height):
         self._action(id, '/execute_resize',
