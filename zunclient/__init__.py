@@ -15,4 +15,4 @@ import pbr.version
 
 
 __version__ = pbr.version.VersionInfo(
-    'python-zunclient').version_string()
+    'chameleon-zunclient').version_string()
