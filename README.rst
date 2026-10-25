@@ -11,13 +11,17 @@ Team and repository tags
 Python bindings to the OpenStack Container API
 ==============================================
 
-.. image:: https://img.shields.io/pypi/v/python-zunclient.svg
-    :target: https://pypi.org/project/python-zunclient/
+.. image:: https://img.shields.io/pypi/v/chameleon-zunclient.svg
+    :target: https://pypi.org/project/chameleon-zunclient/
     :alt: Latest Version
 
 This is a client library for Zun built on the Zun API.
 It provides a Python API (the zunclient module)
 and a command-line tool (zun).
+
+This is Chameleon's fork, published on PyPI as ``chameleon-zunclient``::
+
+    $ pip install chameleon-zunclient
 
 * License: Apache License, Version 2.0
 * `PyPi`_ - package installation
@@ -28,7 +32,7 @@ and a command-line tool (zun).
 * `Source`_
 * `How to Contribute`_
 
-.. _PyPi: https://pypi.org/project/python-zunclient
+.. _PyPi: https://pypi.org/project/chameleon-zunclient
 .. _Online Documentation: https://docs.openstack.org/python-zunclient/latest
 .. _Launchpad project: https://launchpad.net/python-zunclient
 .. _Blueprints: https://blueprints.launchpad.net/python-zunclient
