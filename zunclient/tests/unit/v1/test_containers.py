@@ -21,6 +21,7 @@ from unittest import mock
 import testtools
 from testtools import matchers
 from urllib import parse
+from zunclient import api_versions
 from zunclient.common import utils as zun_utils
 from zunclient.common.websocketclient import k8s_exec
 from zunclient import exceptions
@@ -667,6 +668,40 @@ class ContainerManagerTest(testtools.TestCase):
         self.assertRaises(k8s_exec.SessionError, self.mgr.execute_run,
                           CONTAINER1['id'], CONTAINER1['command'])
         session.close.assert_called_once_with()
+
+    def _execute_url(self, **qparams):
+        return '/v1/containers/%s/execute?%s' % (CONTAINER1['id'],
+                                                 parse.urlencode(qparams))
+
+    def test_containers_execute_interactive_sends_tty_from_1_42(self):
+        url = self._execute_url(command='sh', interactive=True, run=False,
+                                tty=True)
+        api = utils.FakeAPI({url: {'POST': ({}, None)}})
+        mgr = containers.ContainerManager(api)
+        mgr.execute(CONTAINER1['id'], command='sh', interactive=True,
+                    run=False)
+        self.assertEqual([('POST', url, {'Content-Length': '0'}, None)],
+                         api.calls)
+
+    def test_containers_execute_keeps_explicit_tty(self):
+        url = self._execute_url(command='sh', interactive=True, run=False,
+                                tty=False)
+        api = utils.FakeAPI({url: {'POST': ({}, None)}})
+        mgr = containers.ContainerManager(api)
+        mgr.execute(CONTAINER1['id'], command='sh', interactive=True,
+                    run=False, tty=False)
+        self.assertEqual([('POST', url, {'Content-Length': '0'}, None)],
+                         api.calls)
+
+    def test_containers_execute_sends_no_tty_before_1_42(self):
+        url = self._execute_url(command='sh', interactive=True, run=False)
+        api = utils.FakeAPI({url: {'POST': ({}, None)}})
+        api.api_version = api_versions.APIVersion('1.41')
+        mgr = containers.ContainerManager(api)
+        mgr.execute(CONTAINER1['id'], command='sh', interactive=True,
+                    run=False)
+        self.assertEqual([('POST', url, {'Content-Length': '0'}, None)],
+                         api.calls)
 
     def test_containers_kill(self):
         containers = self.mgr.kill(CONTAINER1['id'], signal)
