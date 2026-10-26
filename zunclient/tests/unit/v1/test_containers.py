@@ -11,6 +11,11 @@
 #    under the License.
 
 import copy
+import io
+import os
+import shutil
+import tarfile
+import tempfile
 from unittest import mock
 
 import testtools
@@ -832,3 +837,122 @@ class ContainerManagerTest(testtools.TestCase):
              {'Content-Length': '0'}, None)
         ]
         self.assertEqual(expect, self.api.calls)
+
+
+def tar_archive(*members):
+    """A tar archive, as bytes, of (TarInfo, data) pairs."""
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode='w') as tar:
+        for info, data in members:
+            if data is not None:
+                info.size = len(data)
+                data = io.BytesIO(data)
+            tar.addfile(info, data)
+    return buf.getvalue()
+
+
+def member(name, data=None, **fields):
+    info = tarfile.TarInfo(name)
+    for key, value in fields.items():
+        setattr(info, key, value)
+    return info, data
+
+
+def archive_end(data):
+    """Where the last member of a tar archive ends."""
+    with tarfile.open(fileobj=io.BytesIO(data)) as tar:
+        tar.getmembers()
+        return tar.offset
+
+
+@mock.patch.object(containers.ContainerManager, 'execute_run')
+class CopyFromTest(testtools.TestCase):
+
+    def setUp(self):
+        super(CopyFromTest, self).setUp()
+        self.mgr = containers.ContainerManager(utils.FakeAPI({}))
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp)
+        self.dest = os.path.join(self.tmp, 'dest')
+        os.mkdir(self.dest)
+
+    def archive(self, execute_run, *members):
+        execute_run.return_value = containers.CommandResult(
+            '1234', [], 0, tar_archive(*members), b'')
+
+    def test_copy_from(self, execute_run):
+        self.archive(
+            execute_run,
+            member('data', type=tarfile.DIRTYPE, mode=0o755),
+            member('data/a.txt', b'hello\n'),
+            member('data/b.txt', type=tarfile.LNKTYPE, linkname='data/a.txt'),
+            member('data/bin', type=tarfile.SYMTYPE, linkname='/usr/bin'))
+        self.mgr.copy_from('1234', '/srv/data/', self.dest)
+        execute_run.assert_called_once_with(
+            '1234', ['tar', 'cf', '-', '-C', '/srv', 'data'], check=True)
+        data = os.path.join(self.dest, 'data')
+        with open(os.path.join(data, 'a.txt'), 'rb') as f:
+            self.assertEqual(b'hello\n', f.read())
+        with open(os.path.join(data, 'b.txt'), 'rb') as f:
+            self.assertEqual(b'hello\n', f.read())
+        self.assertEqual('/usr/bin', os.readlink(os.path.join(data, 'bin')))
+
+    def test_copy_from_root(self, execute_run):
+        self.archive(execute_run)
+        self.mgr.copy_from('1234', '/', self.dest)
+        execute_run.assert_called_once_with(
+            '1234', ['tar', 'cf', '-', '-C', '/', '.'], check=True)
+
+    def test_copy_from_refuses_path_outside_dest(self, execute_run):
+        self.archive(execute_run, member('../escape.txt', b'x'))
+        self.assertRaises(tarfile.OutsideDestinationError,
+                          self.mgr.copy_from, '1234', 'f', self.dest)
+        self.assertFalse(
+            os.path.exists(os.path.join(self.tmp, 'escape.txt')))
+
+    def test_copy_from_refuses_hard_link_outside_dest(self, execute_run):
+        outside = os.path.join(self.tmp, 'outside.txt')
+        with open(outside, 'w') as f:
+            f.write('original')
+        # A link to a file outside dest, then a file written through it.
+        self.archive(
+            execute_run,
+            member('x', type=tarfile.LNKTYPE, linkname='../outside.txt'),
+            member('x', b'PWNED'))
+        self.assertRaises(tarfile.LinkOutsideDestinationError,
+                          self.mgr.copy_from, '1234', 'f', self.dest)
+        with open(outside) as f:
+            self.assertEqual('original', f.read())
+
+    def test_copy_from_tar_fails(self, execute_run):
+        execute_run.side_effect = exceptions.CommandFailed(
+            '1234', [], 2, b'', b'tar: nope: No such file or directory\n')
+        self.assertRaises(exceptions.CommandFailed,
+                          self.mgr.copy_from, '1234', 'nope', self.dest)
+
+    def test_copy_from_cut_off_between_files(self, execute_run):
+        data = tar_archive(member('a.txt', b'a'), member('b.txt', b'b'))
+        execute_run.return_value = containers.CommandResult(
+            '1234', [], 0, data[:archive_end(data)], b'')
+        e = self.assertRaises(tarfile.ReadError,
+                              self.mgr.copy_from, '1234', 'f', self.dest)
+        self.assertIn('cut off or damaged', str(e))
+        self.assertEqual([], os.listdir(self.dest))
+
+    def test_copy_from_damaged_header(self, execute_run):
+        data = bytearray(tar_archive(member('a.txt', b'a'),
+                                     member('b.txt', b'b')))
+        # Damage the second member's header, so tarfile stops before it.
+        data[1024 + 100] ^= 0xff
+        execute_run.return_value = containers.CommandResult(
+            '1234', [], 0, bytes(data), b'')
+        self.assertRaises(tarfile.ReadError,
+                          self.mgr.copy_from, '1234', 'f', self.dest)
+        self.assertEqual([], os.listdir(self.dest))
+
+    def test_copy_from_cut_off_inside_a_file(self, execute_run):
+        data = tar_archive(member('a.txt', b'a' * 5000))
+        execute_run.return_value = containers.CommandResult(
+            '1234', [], 0, data[:3000], b'')
+        self.assertRaises(tarfile.ReadError,
+                          self.mgr.copy_from, '1234', 'f', self.dest)
