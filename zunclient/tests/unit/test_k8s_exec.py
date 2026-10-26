@@ -15,6 +15,7 @@ from unittest import mock
 import testtools
 import websocket
 
+from zunclient.common.websocketclient import exceptions
 from zunclient.common.websocketclient import k8s_exec
 
 
@@ -24,6 +25,7 @@ BINARY = websocket.ABNF.OPCODE_BINARY
 # Status JSON has the form written by writeStatus and codeExitToStatusError
 # in k8s.io/apiserver/pkg/util/proxy.
 OUT = (BINARY, b'\x01out\n')
+OPEN_OUT = (BINARY, b'\x01')  # how Kubernetes opens a stream
 ERR = (BINARY, b'\x02err\n')
 SUCCESS = (BINARY, b'\x03{"metadata":{},"status":"Success"}')
 EXIT_3 = (BINARY, b'\x03{"metadata":{},"status":"Failure","message":'
@@ -45,12 +47,18 @@ class FakeWebSocket(object):
     def __init__(self, messages):
         self.messages = list(messages)
         self.closed = False
+        self.sent = []
 
     def recv_data(self):
         message = self.messages.pop(0)
         if isinstance(message, Exception):
             raise message
         return message
+
+    def send_binary(self, data):
+        if self.closed:
+            raise websocket.WebSocketConnectionClosedException()
+        self.sent.append(data)
 
     def close(self):
         self.closed = True
@@ -76,6 +84,27 @@ class ExecSessionTest(testtools.TestCase):
         self.assertEqual(b'out\n', stdout)
         self.assertEqual(b'err\n', stderr)
         self.assertEqual(3, session.exit_code)
+
+    def test_recv(self):
+        session = k8s_exec.ExecSession(FakeWebSocket([
+            OPEN_OUT, OUT, ERR, EXIT_3, CLOSE]))
+        self.assertEqual((k8s_exec.STDOUT, b'out\n'), session.recv())
+        self.assertIsNone(session.exit_code)
+        self.assertEqual((k8s_exec.STDERR, b'err\n'), session.recv())
+        self.assertIsNone(session.recv())
+        self.assertEqual(3, session.exit_code)
+
+    def test_recv_success_is_exit_code_0(self):
+        session = k8s_exec.ExecSession(FakeWebSocket([OUT, SUCCESS, CLOSE]))
+        self.assertEqual((k8s_exec.STDOUT, b'out\n'), session.recv())
+        self.assertIsNone(session.recv())
+        self.assertEqual(0, session.exit_code)
+
+    def test_recv_without_status_raises(self):
+        session = k8s_exec.ExecSession(FakeWebSocket([OUT, CLOSE]))
+        self.assertEqual((k8s_exec.STDOUT, b'out\n'), session.recv())
+        self.assertRaises(k8s_exec.SessionError, session.recv)
+        self.assertIsNone(session.exit_code)
 
     def test_success_is_exit_code_0(self):
         session = k8s_exec.ExecSession(FakeWebSocket([SUCCESS, CLOSE]))
@@ -119,6 +148,36 @@ class ExecSessionTest(testtools.TestCase):
             (BINARY, b'\x03not json'), CLOSE]))
         e = self.assertRaises(k8s_exec.SessionError, session.read_all)
         self.assertIsNone(e.status)
+
+    def test_send(self):
+        ws = FakeWebSocket([])
+        k8s_exec.ExecSession(ws).send(b'ls\n')
+        self.assertEqual([b'\x00ls\n'], ws.sent)
+
+    def test_close_stdin(self):
+        ws = FakeWebSocket([])
+        session = k8s_exec.ExecSession(ws)
+        session.send(b'data')
+        session.close_stdin()
+        self.assertEqual([b'\x00data', b'\xff\x00'], ws.sent)
+
+    def test_resize(self):
+        ws = FakeWebSocket([])
+        k8s_exec.ExecSession(ws).resize(80, 24)
+        self.assertEqual([b'\x04{"Width": 80, "Height": 24}'], ws.sent)
+
+    def test_send_after_end_raises_disconnected(self):
+        ws = FakeWebSocket([EXIT_3, CLOSE])
+        session = k8s_exec.ExecSession(ws)
+        session.read_all()
+        self.assertRaises(exceptions.Disconnected, session.send, b'ls\n')
+        self.assertEqual([], ws.sent)
+
+    def test_send_on_lost_connection_raises_disconnected(self):
+        ws = FakeWebSocket([])
+        ws.closed = True
+        session = k8s_exec.ExecSession(ws)
+        self.assertRaises(exceptions.Disconnected, session.send, b'ls\n')
 
     def test_close(self):
         ws = FakeWebSocket([])

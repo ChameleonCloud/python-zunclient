@@ -215,7 +215,7 @@ class ContainerManager(base.Manager):
         :raises k8s_exec.SessionError: if the session ended without the
             command's exit code, including when the program doesn't exist.
         """
-        session = self._exec_session(id, args)
+        session = self.execute_session(id, args)
         try:
             stdout, stderr = session.read_all()
         finally:
@@ -253,8 +253,13 @@ class ContainerManager(base.Manager):
                     "damaged" % (src_path, id))
             tar.extractall(dest_dir, filter=_copy_from_filter)
 
-    def _exec_session(self, id, args):
-        """Start a command over a websocket; return its ExecSession."""
+    def execute_session(self, id, args, **kwargs):
+        """Start a command over a websocket; return its ExecSession.
+
+        :param args: a list of arguments, or a command line (no shell).
+        :param kwargs: passed to execute(), such as interactive=True for
+            stdin, and tty=False for stdin without a terminal.
+        """
         command = args
         if not isinstance(command, str):
             # The server splits the command with shlex.split, which undoes
@@ -262,7 +267,7 @@ class ContainerManager(base.Manager):
             command = shlex.join(command)
         # Instead of running when the REST API returns, the command begins
         # execution when the websocket connects.
-        response = self.execute(id, command=command, run=False)
+        response = self.execute(id, command=command, run=False, **kwargs)
         return k8s_exec.connect(response['proxy_url'])
 
     def _process_execute_tty(self, kwargs):
