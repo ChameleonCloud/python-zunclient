@@ -11,11 +11,13 @@
 #    under the License.
 
 import copy
+from unittest import mock
 
 import testtools
 from testtools import matchers
 from urllib import parse
 from zunclient.common import utils as zun_utils
+from zunclient.common.websocketclient import k8s_exec
 from zunclient import exceptions
 from zunclient.tests.unit import utils
 from zunclient.v1 import containers
@@ -231,6 +233,24 @@ fake_responses = {
         'POST': (
             {},
             None,
+        ),
+    },
+    '/v1/containers/%s/execute?%s'
+    % (CONTAINER1['id'], parse.urlencode({'command': CONTAINER1['command'],
+                                          'run': False})):
+    {
+        'POST': (
+            {},
+            {'proxy_url': 'ws://proxy.example:6784/?token=t'},
+        ),
+    },
+    '/v1/containers/%s/execute?%s'
+    % (CONTAINER1['id'], parse.urlencode({'command': "sh -c 'echo hello'",
+                                          'run': False})):
+    {
+        'POST': (
+            {},
+            {'proxy_url': 'ws://proxy.example:6784/?token=t'},
         ),
     },
     '/v1/containers/%s/kill?%s' % (CONTAINER1['id'],
@@ -582,6 +602,66 @@ class ContainerManagerTest(testtools.TestCase):
         ]
         self.assertEqual(expect, self.api.calls)
         self.assertIsNone(containers)
+
+    def _execute_run(self, connect, args, exit_code=0, **kwargs):
+        session = connect.return_value
+        session.read_all.return_value = (b'out\n', b'err\n')
+        session.exit_code = exit_code
+        return self.mgr.execute_run(CONTAINER1['id'], args, **kwargs)
+
+    @mock.patch('zunclient.common.websocketclient.k8s_exec.connect')
+    def test_containers_execute_run(self, connect):
+        result = self._execute_run(connect, CONTAINER1['command'],
+                                   exit_code=3)
+        expect = [
+            ('POST', '/v1/containers/%s/execute?%s'
+             % (CONTAINER1['id'], parse.urlencode({'command':
+                                                   CONTAINER1['command'],
+                                                   'run': False})),
+             {'Content-Length': '0'}, None)
+        ]
+        self.assertEqual(expect, self.api.calls)
+        connect.assert_called_once_with('ws://proxy.example:6784/?token=t')
+        self.assertEqual(CONTAINER1['command'], result.args)
+        self.assertEqual(3, result.returncode)
+        self.assertEqual(b'out\n', result.stdout)
+        self.assertEqual(b'err\n', result.stderr)
+        self.assertIn('returncode=3', repr(result))
+        connect.return_value.close.assert_called_once_with()
+
+    @mock.patch('zunclient.common.websocketclient.k8s_exec.connect')
+    def test_containers_execute_run_list(self, connect):
+        args = ['sh', '-c', 'echo hello']
+        result = self._execute_run(connect, args)
+        self.assertEqual(
+            '/v1/containers/%s/execute?%s'
+            % (CONTAINER1['id'], parse.urlencode({
+                'command': "sh -c 'echo hello'", 'run': False})),
+            self.api.calls[0][1])
+        self.assertEqual(args, result.args)
+
+    @mock.patch('zunclient.common.websocketclient.k8s_exec.connect')
+    def test_containers_execute_run_check(self, connect):
+        e = self.assertRaises(exceptions.CommandFailed,
+                              self._execute_run, connect,
+                              CONTAINER1['command'], exit_code=3,
+                              check=True)
+        self.assertEqual(3, e.returncode)
+        self.assertEqual(b'err\n', e.stderr)
+        self.assertEqual(
+            "Command 'sh -c \"echo hello\"' in container 1234 returned "
+            "non-zero exit status 3", str(e))
+        result = self._execute_run(connect, CONTAINER1['command'],
+                                   check=True)
+        self.assertEqual(0, result.returncode)
+
+    @mock.patch('zunclient.common.websocketclient.k8s_exec.connect')
+    def test_containers_execute_run_closes_on_error(self, connect):
+        session = connect.return_value
+        session.read_all.side_effect = k8s_exec.SessionError()
+        self.assertRaises(k8s_exec.SessionError, self.mgr.execute_run,
+                          CONTAINER1['id'], CONTAINER1['command'])
+        session.close.assert_called_once_with()
 
     def test_containers_kill(self):
         containers = self.mgr.kill(CONTAINER1['id'], signal)
