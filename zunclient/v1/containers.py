@@ -12,11 +12,13 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import shlex
 from urllib import parse
 
 from zunclient import api_versions
 from zunclient.common import base
 from zunclient.common import utils
+from zunclient.common.websocketclient import k8s_exec
 from zunclient import exceptions
 
 
@@ -28,6 +30,28 @@ CREATION_ATTRIBUTES = ['name', 'image', 'command', 'cpu', 'memory',
                        'availability_zone', 'auto_heal', 'privileged',
                        'exposed_ports', 'healthcheck', 'registry', 'tty',
                        'host', 'device_profiles', 'entrypoint']
+
+
+class CommandResult(object):
+    """A command that ran in a container and exited."""
+
+    def __init__(self, container, args, returncode, stdout, stderr):
+        self.container = container
+        self.args = args
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+
+    def __repr__(self):
+        return ("<CommandResult container=%s args=%r returncode=%r>"
+                % (self.container, self.args, self.returncode))
+
+    def check_returncode(self):
+        """Raise CommandFailed if the exit code isn't 0."""
+        if self.returncode:
+            raise exceptions.CommandFailed(self.container, self.args,
+                                           self.returncode, self.stdout,
+                                           self.stderr)
 
 
 class Container(base.Resource):
@@ -175,6 +199,39 @@ class ContainerManager(base.Manager):
     def execute(self, id, **kwargs):
         return self._action(id, '/execute',
                             qparams=kwargs)[1]
+
+    def execute_run(self, id, args, check=False):
+        """Run a command in the container and wait for it to exit.
+
+        There is no timeout.
+
+        :param args: a list of arguments, or a command line (no shell).
+        :param check: if True, raise CommandFailed on a nonzero exit code.
+        :returns: a CommandResult, with stdout and stderr as bytes.
+        :raises k8s_exec.SessionError: if the session ended without the
+            command's exit code, including when the program doesn't exist.
+        """
+        session = self._exec_session(id, args)
+        try:
+            stdout, stderr = session.read_all()
+        finally:
+            session.close()
+        result = CommandResult(id, args, session.exit_code, stdout, stderr)
+        if check:
+            result.check_returncode()
+        return result
+
+    def _exec_session(self, id, args):
+        """Start a command over a websocket; return its ExecSession."""
+        command = args
+        if not isinstance(command, str):
+            # The server splits the command with shlex.split, which undoes
+            # shlex.join exactly.
+            command = shlex.join(command)
+        # Instead of running when the REST API returns, the command begins
+        # execution when the websocket connects.
+        response = self.execute(id, command=command, run=False)
+        return k8s_exec.connect(response['proxy_url'])
 
     def execute_resize(self, id, exec_id, width, height):
         self._action(id, '/execute_resize',

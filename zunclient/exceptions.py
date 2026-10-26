@@ -73,3 +73,17 @@ def from_response(response, message=None, traceback=None, method=None,
         response.text = ''
 
     return exceptions.from_response(response, method, url)
+
+
+class CommandFailed(exceptions.ClientException):
+    """A command run in a container exited with a non-zero exit code."""
+
+    def __init__(self, container, cmd, returncode, stdout, stderr):
+        self.container = container
+        self.cmd = cmd
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+        super(CommandFailed, self).__init__(
+            "Command %r in container %s returned non-zero exit status %d"
+            % (cmd, container, returncode))
