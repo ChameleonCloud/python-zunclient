@@ -669,6 +669,17 @@ class ContainerManagerTest(testtools.TestCase):
                           CONTAINER1['id'], CONTAINER1['command'])
         session.close.assert_called_once_with()
 
+    @mock.patch('zunclient.common.websocketclient.k8s_exec.connect')
+    def test_containers_execute_session(self, connect):
+        url = self._execute_url(command='cat', run=False, interactive=True,
+                                tty=False)
+        api = utils.FakeAPI({url: {'POST': ({}, {'proxy_url': 'ws://p/'})}})
+        mgr = containers.ContainerManager(api)
+        session = mgr.execute_session(CONTAINER1['id'], ['cat'],
+                                      interactive=True, tty=False)
+        connect.assert_called_once_with('ws://p/')
+        self.assertIs(connect.return_value, session)
+
     def _execute_url(self, **qparams):
         return '/v1/containers/%s/execute?%s' % (CONTAINER1['id'],
                                                  parse.urlencode(qparams))

@@ -10,7 +10,10 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-"""Read a command's output and exit code from a Kubernetes exec session."""
+"""Read from and write to a command running in a container.
+
+The session speaks Kubernetes' remotecommand protocol, v5.channel.k8s.io.
+"""
 
 import json
 
@@ -25,9 +28,13 @@ V5_PROTOCOL = 'v5.channel.k8s.io'
 
 # The first byte of each message says which channel it is on. ERROR carries
 # the command's result as a Kubernetes Status in JSON, sent for success too.
+# A message on CLOSE closes the channel named in its one-byte payload.
+STDIN = 0
 STDOUT = 1
 STDERR = 2
 ERROR = 3
+RESIZE = 4
+CLOSE = 255
 
 
 class SessionError(exceptions.ContainerWebSocketException):
@@ -56,43 +63,95 @@ def connect(url):
 
 
 class ExecSession(object):
-    """A command running in a container, read over a websocket."""
+    """A command running in a container, read and written over a websocket."""
 
     def __init__(self, ws):
         self._ws = ws
+        self._status = None
+        self._ended = None
         self.exit_code = None
 
-    def read_all(self):
-        """Read to the end; return (stdout, stderr) and set exit_code.
+    def recv(self):
+        """Block until stdout or stderr arrives; return (channel, data).
+
+        data is the bytes that arrived together, not necessarily whole lines.
+        Once the command has exited, return None and set exit_code.
 
         :raises SessionError: if the connection ended before the exit code
             arrived.
         """
-        out, err, status, ended = [], [], None, None
-        while True:
+        # Most messages are output, returned as they arrive. Kubernetes
+        # opens each stream with an empty message, which is skipped. The
+        # status message is kept for its exit code, and the loop ends when
+        # the connection closes.
+        while not self._ended:
             try:
                 opcode, data = self._ws.recv_data()
             except (OSError, websocket.WebSocketException) as e:
                 # The connection was lost. If the exit code had already
                 # arrived, it is still the answer.
-                ended = repr(e)
+                self._ended = repr(e)
                 break
             if opcode == websocket.ABNF.OPCODE_CLOSE:
-                ended = _close_reason(data)
+                self._ended = _close_reason(data)
                 break
             if not data:
                 continue
             channel, payload = data[0], data[1:]
-            if channel == STDOUT:
-                out.append(payload)
-            elif channel == STDERR:
-                err.append(payload)
-            elif channel == ERROR:
-                status = _parse_status(payload)
-        self.exit_code = _exit_code(status)
+            if channel in (STDOUT, STDERR) and payload:
+                return channel, payload
+            if channel == ERROR:
+                self._status = _parse_status(payload)
+        self.exit_code = _exit_code(self._status)
         if self.exit_code is None:
-            raise SessionError(status, ended)
-        return b''.join(out), b''.join(err)
+            raise SessionError(self._status, self._ended)
+        return None
+
+    def send(self, data):
+        """Write bytes to the command's stdin.
+
+        :raises exceptions.Disconnected: if the session has ended.
+        """
+        self._send(STDIN, data)
+
+    def close_stdin(self):
+        """Close the command's stdin, so it sees the end of its input.
+
+        :raises exceptions.Disconnected: if the session has ended.
+        """
+        self._send(CLOSE, bytes([STDIN]))
+
+    def resize(self, width, height):
+        """Set the terminal size, in columns and rows.
+
+        :raises exceptions.Disconnected: if the session has ended.
+        """
+        size = json.dumps({'Width': width, 'Height': height})
+        self._send(RESIZE, size.encode())
+
+    def _send(self, channel, payload):
+        # After a close message arrives, websocket-client still sends
+        # without an error, so check whether recv() saw the end.
+        if self._ended:
+            raise exceptions.Disconnected(self._ended)
+        try:
+            self._ws.send_binary(bytes([channel]) + payload)
+        except (OSError, websocket.WebSocketException) as e:
+            raise exceptions.Disconnected(e)
+
+    def read_all(self):
+        """Block until the command exits; return (stdout, stderr) as bytes.
+
+        :raises SessionError: if the connection ended before the exit code
+            arrived.
+        """
+        out, err = [], []
+        while True:
+            message = self.recv()
+            if message is None:
+                return b''.join(out), b''.join(err)
+            channel, data = message
+            (out if channel == STDOUT else err).append(data)
 
     def close(self):
         """Close the session's websocket."""
