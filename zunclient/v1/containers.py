@@ -12,7 +12,10 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import io
+import posixpath
 import shlex
+import tarfile
 from urllib import parse
 
 from zunclient import api_versions
@@ -221,6 +224,34 @@ class ContainerManager(base.Manager):
             result.check_returncode()
         return result
 
+    def copy_from(self, id, src_path, dest_dir):
+        """Copy a file or directory from the container into dest_dir.
+
+        It runs tar in the container and holds the archive in memory.
+
+        :raises CommandFailed: if tar in the container fails, for example
+            because src_path doesn't exist.
+        :raises tarfile.FilterError: if a file would land outside dest_dir.
+            Files extracted before it stay.
+        :raises tarfile.ReadError: if the archive is incomplete. Nothing is
+            extracted then.
+        """
+        parent, name = posixpath.split(posixpath.normpath(src_path))
+        result = self.execute_run(
+            id, ['tar', 'cf', '-', '-C', parent or '.', name or '.'],
+            check=True)
+        with tarfile.open(fileobj=io.BytesIO(result.stdout)) as tar:
+            tar.getmembers()
+            # tar ends an archive with at least 1024 zero bytes. tarfile
+            # stops without an error at a damaged header, so check that
+            # everything after the last member is zeros.
+            rest = result.stdout[tar.offset:]
+            if len(rest) < 1024 or any(rest):
+                raise tarfile.ReadError(
+                    "The archive of %s from container %s is cut off or "
+                    "damaged" % (src_path, id))
+            tar.extractall(dest_dir, filter=_copy_from_filter)
+
     def _exec_session(self, id, args):
         """Start a command over a websocket; return its ExecSession."""
         command = args
@@ -318,3 +349,12 @@ class ContainerManager(base.Manager):
     def remove_security_group(self, id, security_group):
         return self._action(id, '/remove_security_group',
                             qparams={'name': security_group})
+
+
+def _copy_from_filter(member, dest_path):
+    # The 'tar' filter keeps symlinks that point outside dest_path, which a
+    # container's files often have, but only 'data' checks where a hard
+    # link points.
+    if member.islnk():
+        return tarfile.data_filter(member, dest_path)
+    return tarfile.tar_filter(member, dest_path)
