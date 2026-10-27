@@ -18,6 +18,7 @@ from unittest import mock
 import testtools
 import websocket
 
+from zunclient.common.websocketclient import exceptions
 from zunclient.common.websocketclient import k8s_exec
 from zunclient.tests.unit import k8s_exec_server
 
@@ -113,7 +114,8 @@ class ReadTest(testtools.TestCase):
 
     def test_stdout_stderr_and_exit_code(self):
         session = k8s_exec.ExecSession(FakeWebSocket(OUT, ERR, EXIT_3, CLOSE))
-        self.assertEqual((b'out\n', b'err\n'), session.read_all())
+        self.assertEqual((b'out\n', b'err\n'),
+                         session.communicate(timeout=TIMEOUT))
         self.assertEqual(3, session.exit_code)
 
     def test_recv(self):
@@ -160,6 +162,16 @@ class ReadTest(testtools.TestCase):
         thread.join(TIMEOUT)
         self.assertEqual([(k8s_exec.STDOUT, b'out\n')], shown)
 
+    def test_communicate_timeout_has_output_so_far(self):
+        ws = FakeWebSocket(OUT, ERR)
+        session = k8s_exec.ExecSession(ws)
+        self.addCleanup(session.close, timeout=0)
+        e = self.assertRaises(k8s_exec.ExecTimeout, session.communicate,
+                              timeout=0.05)
+        self.assertEqual(b'out\n', e.stdout)
+        self.assertEqual(b'err\n', e.stderr)
+        self.assertIn('still running after 0.05 seconds', str(e))
+
     def test_wait_timeout_leaves_session_running(self):
         ws = FakeWebSocket()
         session = k8s_exec.ExecSession(ws)
@@ -169,7 +181,8 @@ class ReadTest(testtools.TestCase):
 
     def test_close_without_status_raises(self):
         session = k8s_exec.ExecSession(FakeWebSocket(OUT, CLOSE))
-        e = self.assertRaises(k8s_exec.SessionError, session.read_all)
+        e = self.assertRaises(k8s_exec.SessionError, session.communicate,
+                              timeout=TIMEOUT)
         self.assertIsNone(e.status)
         self.assertEqual('closed with code 1000', e.reason)
         self.assertIsNone(session.exit_code)
@@ -219,7 +232,7 @@ class SinkTest(testtools.TestCase):
         session = k8s_exec.ExecSession(
             FakeWebSocket(OPEN_OUT, OUT, ERR, OUT, EXIT_3, CLOSE),
             stdout=out.append, stderr=err)
-        self.assertEqual((b'', b''), session.read_all())
+        self.assertEqual((b'', b''), session.communicate(timeout=TIMEOUT))
         self.assertEqual([b'out\n', b'out\n'], out)
         self.assertEqual(b'err\n', err.getvalue())
 
@@ -265,6 +278,87 @@ class SinkTest(testtools.TestCase):
         self.assertFalse(session._reader.is_alive())
 
 
+class WriteTest(testtools.TestCase):
+
+    def setUp(self):
+        super(WriteTest, self).setUp()
+        self.ws = FakeWebSocket()
+        self.session = k8s_exec.ExecSession(self.ws)
+        self.addCleanup(self.session.close, timeout=0)
+
+    def test_send(self):
+        self.session.send(b'ls\n')
+        self.assertEqual([b'\x00ls\n'], self.ws.sent)
+
+    def test_send_splits_large_writes(self):
+        self.session.send(b'x' * (k8s_exec.CHUNK_SIZE * 2 + 1))
+        self.assertEqual([k8s_exec.CHUNK_SIZE + 1, k8s_exec.CHUNK_SIZE + 1,
+                          2], [len(m) for m in self.ws.sent])
+        self.assertTrue(all(m[:1] == b'\x00' for m in self.ws.sent))
+
+    def test_close_stdin(self):
+        self.session.send(b'data')
+        self.session.close_stdin()
+        self.assertEqual([b'\x00data', b'\xff\x00'], self.ws.sent)
+
+    def test_resize(self):
+        self.session.resize(80, 24)
+        self.assertEqual([b'\x04{"Width": 80, "Height": 24}'], self.ws.sent)
+
+    def test_send_after_end_raises_disconnected(self):
+        self.ws.receive(EXIT_3, CLOSE)
+        self.session.wait(TIMEOUT)
+        e = self.assertRaises(exceptions.Disconnected, self.session.send,
+                              b'ls\n')
+        self.assertIn('closed with code 1000', str(e))
+        self.assertEqual([], self.ws.sent)
+
+    def test_send_on_lost_connection_raises_disconnected(self):
+        self.ws.shut_down = True
+        self.assertRaises(exceptions.Disconnected, self.session.send, b'ls\n')
+
+    def test_communicate_writes_input_then_closes_stdin(self):
+        # The "command" answers only once all its input has arrived, which
+        # happens on another thread while communicate() reads.
+        def command():
+            while self.ws.sent[-1:] != [b'\xff\x00']:
+                threading.Event().wait(0.001)
+            self.ws.receive(OUT, SUCCESS, CLOSE)
+        threading.Thread(target=command, daemon=True).start()
+        self.assertEqual((b'out\n', b''),
+                         self.session.communicate(b'in', timeout=TIMEOUT))
+        self.assertEqual([b'\x00in', b'\xff\x00'], self.ws.sent)
+
+    def test_input_from_a_file(self):
+        data = b'y' * (k8s_exec.CHUNK_SIZE + 10)
+        self.session._write_input(io.BytesIO(data), [])
+        self.assertEqual(data, b''.join(m[1:] for m in self.ws.sent[:-1]))
+        self.assertEqual(b'\xff\x00', self.ws.sent[-1])
+
+    def test_communicate_raises_input_error(self):
+        class Broken(object):
+            def read(self, size):
+                raise OSError(5, 'Input/output error')
+
+        # The "command" exits once its stdin is closed.
+        def command():
+            while self.ws.sent[-1:] != [b'\xff\x00']:
+                threading.Event().wait(0.001)
+            self.ws.receive(SUCCESS, CLOSE)
+        threading.Thread(target=command, daemon=True).start()
+        e = self.assertRaises(OSError, self.session.communicate, Broken(),
+                              timeout=TIMEOUT)
+        self.assertEqual(5, e.errno)
+        self.assertEqual([b'\xff\x00'], self.ws.sent)
+
+    def test_input_ignored_once_command_has_exited(self):
+        # Like a broken pipe: the command exited without reading its input.
+        self.ws.receive(EXIT_3, CLOSE)
+        self.session.wait(TIMEOUT)
+        self.session._write_input(b'unread', [])
+        self.assertEqual([], self.ws.sent)
+
+
 class CloseTest(testtools.TestCase):
 
     def test_close_running_session(self):
@@ -305,6 +399,40 @@ class CloseTest(testtools.TestCase):
 class RealSocketTest(testtools.TestCase):
     """Against a real TCP socket, where unread output fills the buffers."""
 
+    @staticmethod
+    def _cat(conn):
+        while True:
+            data = conn.stdin()
+            if data is None:
+                return k8s_exec_server.SUCCESS
+            conn.stdout(data)
+
+    # A one-message queue leaves only the socket buffers as slack, so this
+    # stalls unless communicate() reads while it writes. (With the default
+    # queue, about 4 MiB of output can wait unread.)
+    @mock.patch.object(k8s_exec, 'QUEUE_SIZE', 1)
+    def test_communicate_pipes_more_than_the_socket_buffers_hold(self):
+        # Writing all the input before reading any output stalls once the
+        # buffers fill in both directions; communicate() must not.
+        server = k8s_exec_server.ExecServer(self._cat)
+        data = bytes(range(256)) * (16 * 4096)  # 16 MiB
+        session = k8s_exec.connect(server.url)
+        result = []
+        # A stalled write has no timeout, so run it where the test can give
+        # up on it, and fail instead of hanging the test run.
+        worker = threading.Thread(
+            target=lambda: result.append(session.communicate(data)),
+            daemon=True)
+        worker.start()
+        worker.join(60)
+        session.close(timeout=0)
+        self.assertFalse(worker.is_alive(), "communicate() stalled")
+        stdout, stderr = result[0]
+        server.join()
+        self.assertEqual(0, session.exit_code)
+        self.assertEqual(len(data), len(stdout))
+        self.assertTrue(stdout == data)  # assertEqual would print 16 MiB
+
     def test_close_wakes_reader_on_silent_server(self):
         # On a real socket, websocket-client's shutdown() leaves a thread
         # blocked in recv_data(); close() must not.
@@ -315,3 +443,23 @@ class RealSocketTest(testtools.TestCase):
         session.close(timeout=0.1)
         session._reader.join(TIMEOUT)
         self.assertFalse(session._reader.is_alive())
+
+    def test_stream_file_to_file(self):
+        def upper(conn):
+            while True:
+                data = conn.stdin()
+                if data is None:
+                    conn.stderr(b'done\n')
+                    return k8s_exec_server.SUCCESS
+                conn.stdout(data.upper())
+        server = k8s_exec_server.ExecServer(upper)
+        out, err = io.BytesIO(), io.BytesIO()
+        session = k8s_exec.connect(server.url, stdout=out, stderr=err)
+        try:
+            self.assertEqual((b'', b''), session.communicate(
+                io.BytesIO(b'abc' * 100000), timeout=60))
+        finally:
+            session.close()
+        server.join()
+        self.assertEqual(b'ABC' * 100000, out.getvalue())
+        self.assertEqual(b'done\n', err.getvalue())

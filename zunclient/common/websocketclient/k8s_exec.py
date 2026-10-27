@@ -10,7 +10,7 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-"""Run a command in a container and stream its output.
+"""Run a command in a container and stream its input and output.
 
 The session speaks Kubernetes' remotecommand protocol, v5.channel.k8s.io,
 through Zun's websocket proxy. Each websocket message is one channel byte
@@ -22,13 +22,20 @@ How a session works:
   from the websocket and the only code that changes the session's state. It
   hands stdout and stderr to sinks, or queues them for recv(), and keeps the
   Status message that carries the exit code.
+* Any thread may write: send(), close_stdin() and resize().
 * wait() blocks until the reader has finished and returns the exit code.
+
+Because something is always reading, a command can't stall with its output
+unread while the client is still writing its input. To pipe a large stream
+through a command, give the session sinks, or use communicate(), which
+writes from a second thread while it reads.
 """
 
 import json
 import queue
 import socket
 import threading
+import time
 
 from oslo_log import log as logging
 import websocket
@@ -40,10 +47,18 @@ LOG = logging.getLogger(__name__)
 V5_PROTOCOL = 'v5.channel.k8s.io'
 
 # Channel numbers, the first byte of every message. ERROR carries the
-# command's result as a Kubernetes Status in JSON, sent for success too.
+# command's result as a Kubernetes Status in JSON, sent for success too. A
+# message on CLOSE closes the channel named in its one-byte payload.
+STDIN = 0
 STDOUT = 1
 STDERR = 2
 ERROR = 3
+RESIZE = 4
+CLOSE = 255
+
+# Large writes are split into messages of this size, so that a resize or a
+# close can go out between them instead of waiting behind one huge message.
+CHUNK_SIZE = 64 * 1024
 
 # How many output messages recv() may fall behind before the reader waits.
 # A full queue slows the command down rather than filling memory.
@@ -77,10 +92,14 @@ class ExecTimeout(exceptions.ContainerWebSocketException):
     The command isn't stopped; it keeps running in the container.
 
     :ivar timeout: the timeout, in seconds.
+    :ivar stdout: the output communicate() had read, as bytes, or None if
+        recv() or wait() timed out; likewise stderr.
     """
 
-    def __init__(self, timeout):
+    def __init__(self, timeout, stdout=None, stderr=None):
         self.timeout = timeout
+        self.stdout = stdout
+        self.stderr = stderr
         super(ExecTimeout, self).__init__(
             message="The command was still running after %s seconds"
                     % timeout)
@@ -90,7 +109,7 @@ def connect(url, stdout=None, stderr=None):
     """Start an exec session at the URL that containers.execute returned.
 
     :param stdout: where stdout goes: a function that takes bytes, or a
-        binary file. If None, read it with recv() or read_all().
+        binary file. If None, read it with recv() or communicate().
     :param stderr: the same, for stderr.
     """
     ws = websocket.create_connection(url, subprotocols=[V5_PROTOCOL])
@@ -201,17 +220,112 @@ class ExecSession(object):
             raise SessionError(self.status, self._ended)
         return self.exit_code
 
+    # Writing. Any thread may call these.
+
+    def send(self, data):
+        """Write bytes to the command's stdin.
+
+        :raises exceptions.Disconnected: if the session has ended.
+        """
+        view = memoryview(data)
+        for start in range(0, len(view), CHUNK_SIZE):
+            self._send(STDIN, view[start:start + CHUNK_SIZE])
+
+    def close_stdin(self):
+        """Close the command's stdin, so it sees the end of its input.
+
+        :raises exceptions.Disconnected: if the session has ended.
+        """
+        self._send(CLOSE, bytes([STDIN]))
+
+    def resize(self, width, height):
+        """Set the terminal size, in columns and rows.
+
+        :raises exceptions.Disconnected: if the session has ended.
+        """
+        size = json.dumps({'Width': width, 'Height': height})
+        self._send(RESIZE, size.encode())
+
+    def _send(self, channel, payload):
+        # websocket-client doesn't fail a send after the server's close
+        # message, so check whether the reader has seen the end.
+        if self._done.is_set():
+            raise exceptions.Disconnected(self._ended)
+        try:
+            self._ws.send_binary(bytes([channel]) + bytes(payload))
+        except (OSError, websocket.WebSocketException) as e:
+            raise exceptions.Disconnected(e)
+
     # Whole-command helpers.
+
+    def communicate(self, input=None, timeout=None):
+        """Write input, close stdin, and read until the command exits.
+
+        Like subprocess.Popen.communicate. Input is written from a second
+        thread while this one reads, so neither side waits on the other.
+        If reading the input raises an exception, communicate() raises it
+        once the command has exited.
+
+        :param input: bytes, or a binary file to copy from. If None, stdin
+            is left as it is.
+        :param timeout: seconds to wait for the command to exit.
+        :returns: (stdout, stderr) as bytes. A channel that has a sink
+            returns b''.
+        :raises SessionError: if the session ended without the exit code.
+        :raises ExecTimeout: if the command is still running after timeout
+            seconds, with the output read so far. The session stays open.
+        """
+        writer, input_errors = None, []
+        if input is not None:
+            writer = threading.Thread(target=self._write_input,
+                                      args=(input, input_errors),
+                                      name='k8s-exec-writer', daemon=True)
+            writer.start()
+        deadline = _Deadline(timeout)
+        output = {STDOUT: [], STDERR: []}
+        while True:
+            try:
+                message = self.recv(timeout=deadline.remaining())
+            except ExecTimeout:
+                raise ExecTimeout(timeout, b''.join(output[STDOUT]),
+                                  b''.join(output[STDERR]))
+            if message is None:
+                break
+            channel, data = message
+            output[channel].append(data)
+        if writer is not None:
+            writer.join()
+            if input_errors:
+                raise input_errors[0]
+        return b''.join(output[STDOUT]), b''.join(output[STDERR])
 
     def read_all(self):
         """Block until the command exits; return (stdout, stderr) as bytes."""
-        output = {STDOUT: [], STDERR: []}
-        while True:
-            message = self.recv()
-            if message is None:
-                return b''.join(output[STDOUT]), b''.join(output[STDERR])
-            channel, data = message
-            output[channel].append(data)
+        return self.communicate()
+
+    def _write_input(self, input, errors):
+        try:
+            if isinstance(input, (bytes, bytearray, memoryview)):
+                self.send(input)
+            else:
+                while True:
+                    data = input.read(CHUNK_SIZE)
+                    if not data:
+                        break
+                    self.send(data)
+            self.close_stdin()
+        except exceptions.Disconnected:
+            # The command exited before reading all its input, like a
+            # broken pipe. wait() reports how the session ended.
+            pass
+        except Exception as e:
+            # Reading the input failed. Close stdin so that the command
+            # doesn't wait for the rest, and let communicate() raise it.
+            errors.append(e)
+            try:
+                self.close_stdin()
+            except exceptions.Disconnected:
+                pass
 
     def close(self, timeout=3):
         """End the session. The command keeps running if it hasn't exited.
@@ -249,6 +363,17 @@ class ExecSession(object):
             # Keep the end marker, so a recv() after close() returns None
             # instead of waiting forever.
             self._output.put_nowait(_END)
+
+
+class _Deadline(object):
+    def __init__(self, timeout):
+        self._timeout = timeout
+        self._start = time.monotonic()
+
+    def remaining(self):
+        if self._timeout is None:
+            return None
+        return max(0, self._timeout - (time.monotonic() - self._start))
 
 
 def _as_sink(target):
