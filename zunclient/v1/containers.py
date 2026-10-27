@@ -204,20 +204,27 @@ class ContainerManager(base.Manager):
         return self._action(id, '/execute',
                             qparams=kwargs)[1]
 
-    def execute_run(self, id, args, check=False):
+    def execute_run(self, id, args, check=False, input=None, timeout=None):
         """Run a command in the container and wait for it to exit.
-
-        There is no timeout.
 
         :param args: a list of arguments, or a command line (no shell).
         :param check: if True, raise CommandFailed on a nonzero exit code.
+        :param input: bytes, or a binary file, for the command's stdin. The
+            command sees the end of its input after the last byte.
+        :param timeout: seconds to wait for the command to exit. On a
+            timeout the session is closed; the command keeps running.
         :returns: a CommandResult, with stdout and stderr as bytes.
         :raises k8s_exec.SessionError: if the session ended without the
             command's exit code, including when the program doesn't exist.
+        :raises k8s_exec.ExecTimeout: if the command ran longer than
+            timeout, with the output so far.
         """
-        session = self._exec_session(id, args)
+        kwargs = {}
+        if input is not None:
+            kwargs.update(interactive=True, tty=False)
+        session = self.execute_session(id, args, **kwargs)
         try:
-            stdout, stderr = session.read_all()
+            stdout, stderr = session.communicate(input, timeout=timeout)
         finally:
             session.close()
         result = CommandResult(id, args, session.exit_code, stdout, stderr)
@@ -253,8 +260,18 @@ class ContainerManager(base.Manager):
                     "damaged" % (src_path, id))
             tar.extractall(dest_dir, filter=_copy_from_filter)
 
-    def _exec_session(self, id, args):
-        """Start a command over a websocket; return its ExecSession."""
+    def execute_session(self, id, args, stdout=None, stderr=None, **kwargs):
+        """Start a command over a websocket; return its ExecSession.
+
+        :param args: a list of arguments, or a command line (no shell).
+        :param stdout: where stdout goes as it arrives: a function that
+            takes bytes, or a binary file. If None, read it from the session
+            with recv() or communicate().
+        :param stderr: the same, for stderr. With a tty, stderr is part of
+            stdout.
+        :param kwargs: passed to execute(), such as interactive=True for
+            stdin, and tty=False for stdin without a terminal.
+        """
         command = args
         if not isinstance(command, str):
             # The server splits the command with shlex.split, which undoes
@@ -262,8 +279,9 @@ class ContainerManager(base.Manager):
             command = shlex.join(command)
         # Instead of running when the REST API returns, the command begins
         # execution when the websocket connects.
-        response = self.execute(id, command=command, run=False)
-        return k8s_exec.connect(response['proxy_url'])
+        response = self.execute(id, command=command, run=False, **kwargs)
+        return k8s_exec.connect(response['proxy_url'], stdout=stdout,
+                                stderr=stderr)
 
     def _process_execute_tty(self, kwargs):
         tty_microversion = api_versions.APIVersion("1.42")
