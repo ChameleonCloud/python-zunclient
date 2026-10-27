@@ -611,7 +611,7 @@ class ContainerManagerTest(testtools.TestCase):
 
     def _execute_run(self, connect, args, exit_code=0, **kwargs):
         session = connect.return_value
-        session.read_all.return_value = (b'out\n', b'err\n')
+        session.communicate.return_value = (b'out\n', b'err\n')
         session.exit_code = exit_code
         return self.mgr.execute_run(CONTAINER1['id'], args, **kwargs)
 
@@ -627,7 +627,10 @@ class ContainerManagerTest(testtools.TestCase):
              {'Content-Length': '0'}, None)
         ]
         self.assertEqual(expect, self.api.calls)
-        connect.assert_called_once_with('ws://proxy.example:6784/?token=t')
+        connect.assert_called_once_with('ws://proxy.example:6784/?token=t',
+                                        stdout=None, stderr=None)
+        connect.return_value.communicate.assert_called_once_with(
+            None, timeout=None)
         self.assertEqual(CONTAINER1['command'], result.args)
         self.assertEqual(3, result.returncode)
         self.assertEqual(b'out\n', result.stdout)
@@ -664,10 +667,46 @@ class ContainerManagerTest(testtools.TestCase):
     @mock.patch('zunclient.common.websocketclient.k8s_exec.connect')
     def test_containers_execute_run_closes_on_error(self, connect):
         session = connect.return_value
-        session.read_all.side_effect = k8s_exec.SessionError()
+        session.communicate.side_effect = k8s_exec.SessionError()
         self.assertRaises(k8s_exec.SessionError, self.mgr.execute_run,
                           CONTAINER1['id'], CONTAINER1['command'])
         session.close.assert_called_once_with()
+
+    @mock.patch('zunclient.common.websocketclient.k8s_exec.connect')
+    def test_containers_execute_run_with_input(self, connect):
+        url = self._execute_url(command='cat', run=False, interactive=True,
+                                tty=False)
+        api = utils.FakeAPI({url: {'POST': ({}, {'proxy_url': 'ws://p/'})}})
+        mgr = containers.ContainerManager(api)
+        session = connect.return_value
+        session.communicate.return_value = (b'in', b'')
+        session.exit_code = 0
+        result = mgr.execute_run(CONTAINER1['id'], ['cat'], input=b'in',
+                                 timeout=10)
+        self.assertEqual(b'in', result.stdout)
+        session.communicate.assert_called_once_with(b'in', timeout=10)
+
+    @mock.patch('zunclient.common.websocketclient.k8s_exec.connect')
+    def test_containers_execute_run_closes_on_timeout(self, connect):
+        session = connect.return_value
+        session.communicate.side_effect = k8s_exec.ExecTimeout(1)
+        self.assertRaises(k8s_exec.ExecTimeout, self.mgr.execute_run,
+                          CONTAINER1['id'], CONTAINER1['command'], timeout=1)
+        session.close.assert_called_once_with()
+
+    @mock.patch('zunclient.common.websocketclient.k8s_exec.connect')
+    def test_containers_execute_session(self, connect):
+        url = self._execute_url(command='cat', run=False, interactive=True,
+                                tty=False)
+        api = utils.FakeAPI({url: {'POST': ({}, {'proxy_url': 'ws://p/'})}})
+        mgr = containers.ContainerManager(api)
+        out = []
+        session = mgr.execute_session(CONTAINER1['id'], ['cat'],
+                                      stdout=out.append,
+                                      interactive=True, tty=False)
+        connect.assert_called_once_with('ws://p/', stdout=out.append,
+                                        stderr=None)
+        self.assertIs(connect.return_value, session)
 
     def _execute_url(self, **qparams):
         return '/v1/containers/%s/execute?%s' % (CONTAINER1['id'],
