@@ -105,14 +105,21 @@ class ExecTimeout(exceptions.ContainerWebSocketException):
                     % timeout)
 
 
-def connect(url, stdout=None, stderr=None):
+def connect(url, stdout=None, stderr=None, timeout=30):
     """Start an exec session at the URL that containers.execute returned.
 
     :param stdout: where stdout goes: a function that takes bytes, or a
         binary file. If None, read it with recv() or communicate().
     :param stderr: the same, for stderr.
+    :param timeout: seconds to wait for the connection to open.
     """
-    ws = websocket.create_connection(url, subprotocols=[V5_PROTOCOL])
+    # No Origin header: this isn't a browser, and Zun's proxy accepts a
+    # client without one.
+    ws = websocket.create_connection(url, subprotocols=[V5_PROTOCOL],
+                                     timeout=timeout, suppress_origin=True)
+    # The timeout was for connecting. The reader waits for output as long
+    # as the command runs; use wait(timeout) to bound that instead.
+    ws.settimeout(None)
     return ExecSession(ws, stdout=stdout, stderr=stderr)
 
 

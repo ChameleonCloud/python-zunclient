@@ -106,7 +106,10 @@ class ConnectTest(testtools.TestCase):
         session = k8s_exec.connect('wss://proxy.example:6784/?token=t')
         create_connection.assert_called_once_with(
             'wss://proxy.example:6784/?token=t',
-            subprotocols=['v5.channel.k8s.io'])
+            subprotocols=['v5.channel.k8s.io'], timeout=30,
+            suppress_origin=True)
+        # The connect timeout must not limit how long output may take.
+        ws.settimeout.assert_called_once_with(None)
         self.assertIs(ws, session._ws)
 
 
