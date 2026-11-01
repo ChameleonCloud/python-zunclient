@@ -19,6 +19,7 @@ import binascii
 import os
 import re
 import shlex
+import sys
 
 from oslo_serialization import jsonutils
 from oslo_utils import netutils
@@ -209,6 +210,41 @@ def parse_command(command):
             c = '"' + c + '"'
             output.append(c)
     return " ".join(output)
+
+
+def exec_command(client, container, args):
+    """Run a command in a container without a terminal; return its exit code.
+
+    Its stdout and stderr go to ours as they arrive, as with docker exec.
+    """
+    session = client.containers.execute_session(
+        container, args, stdout=sys.stdout.buffer, stderr=sys.stderr.buffer)
+    try:
+        return session.wait()
+    finally:
+        session.close()
+
+
+def copy(client, source, destination):
+    """Copy between [container:]path arguments, as docker cp does.
+
+    :returns: False if neither argument names a container.
+    :raises exc.CommandError: with tar's error, if tar in the container
+        fails.
+    """
+    try:
+        if ':' in source:
+            container, path = source.split(':', 1)
+            client.containers.copy_from(container, path, destination)
+        elif ':' in destination:
+            container, path = destination.split(':', 1)
+            client.containers.copy_to(container, source, path)
+        else:
+            return False
+    except exc.CommandFailed as e:
+        raise exc.CommandError(
+            e.stderr.decode(errors='replace').strip() or str(e))
+    return True
 
 
 def parse_entrypoint(entrypoint):

@@ -13,10 +13,6 @@
 #    under the License.
 
 import argparse
-from contextlib import closing
-import io
-import os
-import tarfile
 import time
 import yaml
 
@@ -25,6 +21,7 @@ from oslo_serialization import jsonutils
 from zunclient.common import cliutils as utils
 from zunclient.common import utils as zun_utils
 from zunclient.common.websocketclient import exceptions
+from zunclient.common.websocketclient import terminal
 from zunclient.common.websocketclient import websocketclient
 from zunclient import exceptions as exc
 
@@ -536,24 +533,13 @@ def do_logs(cs, args):
            dest='interactive',
            action='store_true',
            default=False,
-           help='Keep STDIN open and allocate a pseudo-TTY for interactive')
+           help='Keep STDIN open, and run the command in a terminal if '
+                'STDIN is one.')
 def do_exec(cs, args):
     """Execute command in a running container."""
-    opts = {}
-    opts['command'] = zun_utils.parse_command(args.command)
     if args.interactive:
-        opts['interactive'] = True
-        opts['run'] = False
-    response = cs.containers.execute(args.container, **opts)
-    if args.interactive:
-        exec_id = response['exec_id']
-        url = response['proxy_url']
-        websocketclient.do_exec(cs, url, args.container, exec_id, "~", 0.5)
-    else:
-        output = response['output']
-        exit_code = response['exit_code']
-        print(output)
-        return exit_code
+        return terminal.exec_interactive(cs, args.container, args.command)
+    return zun_utils.exec_command(cs, args.container, args.command)
 
 
 @utils.arg('containers',
@@ -886,39 +872,11 @@ def do_top(cs, args):
                 'The format of this parameter is [container:]dest_path.')
 def do_cp(cs, args):
     """Copy files/tars between a container and the local filesystem."""
-    if ':' in args.source:
-        source_parts = args.source.split(':', 1)
-        container_id = source_parts[0]
-        container_path = source_parts[1]
-        opts = {}
-        opts['id'] = container_id
-        opts['path'] = container_path
-
-        res = cs.containers.get_archive(**opts)
-        dest_path = args.destination
-        tardata = io.BytesIO(res['data'])
-        with closing(tarfile.open(fileobj=tardata)) as tar:
-            tar.extractall(dest_path)  # nosec
-
-    elif ':' in args.destination:
-        dest_parts = args.destination.split(':', 1)
-        container_id = dest_parts[0]
-        container_path = dest_parts[1]
-        filename = os.path.split(args.source)[1]
-        opts = {}
-        opts['id'] = container_id
-        opts['path'] = container_path
-        tardata = io.BytesIO()
-        with closing(tarfile.open(fileobj=tardata, mode='w')) as tar:
-            tar.add(args.source, arcname=filename)
-        opts['data'] = tardata.getvalue()
-        cs.containers.put_archive(**opts)
-
-    else:
+    if not zun_utils.copy(cs, args.source, args.destination):
         print("Please check the parameters for zun copy!")
         print("Usage:")
-        print("zun cp container:src_path dest_path|-")
-        print("zun cp src_path|- container:dest_path")
+        print("zun cp container:src_path dest_path")
+        print("zun cp src_path container:dest_path")
 
 
 @utils.arg('container',

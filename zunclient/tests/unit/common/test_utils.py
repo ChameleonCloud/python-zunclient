@@ -15,6 +15,8 @@
 #    under the License.
 
 import collections
+import io
+from unittest import mock
 
 from zunclient.common import cliutils
 from zunclient.common import utils
@@ -261,3 +263,56 @@ class ParseCommandTest(test_utils.BaseTestCase):
         command = ['sh', '-c', 'echo hello']
         result = utils.parse_command(command)
         self.assertEqual('"sh" "-c" "echo hello"', result)
+
+
+class ExecCommandTest(test_utils.BaseTestCase):
+
+    def test_streams_output_and_returns_exit_code(self):
+        client = mock.Mock()
+        session = client.containers.execute_session.return_value
+        session.wait.return_value = 3
+        stdout = mock.Mock(buffer=io.BytesIO())
+        stderr = mock.Mock(buffer=io.BytesIO())
+        with mock.patch('sys.stdout', stdout), \
+                mock.patch('sys.stderr', stderr):
+            self.assertEqual(3, utils.exec_command(client, 'c', ['ls', '/']))
+        client.containers.execute_session.assert_called_once_with(
+            'c', ['ls', '/'], stdout=stdout.buffer, stderr=stderr.buffer)
+        session.close.assert_called_once_with()
+
+    def test_closes_session_on_error(self):
+        client = mock.Mock()
+        session = client.containers.execute_session.return_value
+        session.wait.side_effect = KeyboardInterrupt
+        with mock.patch('sys.stdout'), mock.patch('sys.stderr'):
+            self.assertRaises(KeyboardInterrupt, utils.exec_command, client,
+                              'c', ['sleep', '100'])
+        session.close.assert_called_once_with()
+
+
+class CopyTest(test_utils.BaseTestCase):
+
+    def test_from_container(self):
+        client = mock.Mock()
+        self.assertTrue(utils.copy(client, 'c:/etc/hosts', '/tmp/x'))
+        client.containers.copy_from.assert_called_once_with(
+            'c', '/etc/hosts', '/tmp/x')
+
+    def test_to_container(self):
+        client = mock.Mock()
+        self.assertTrue(utils.copy(client, 'data/', 'c:/srv'))
+        client.containers.copy_to.assert_called_once_with(
+            'c', 'data/', '/srv')
+
+    def test_no_container(self):
+        client = mock.Mock()
+        self.assertFalse(utils.copy(client, 'a', 'b'))
+        self.assertEqual([], client.mock_calls)
+
+    def test_tar_error(self):
+        client = mock.Mock()
+        client.containers.copy_to.side_effect = exc.CommandFailed(
+            'c', [], 2, b'', b'tar: /missing: Cannot open: No such file\n')
+        e = self.assertRaises(exc.CommandError, utils.copy, client, 'a',
+                              'c:/missing')
+        self.assertEqual('tar: /missing: Cannot open: No such file', str(e))

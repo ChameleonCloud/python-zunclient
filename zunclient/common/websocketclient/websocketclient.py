@@ -300,27 +300,6 @@ class AttachClient(WebSocketClient):
         self.cs.containers.resize(self.id, width, height)
 
 
-class ExecClient(WebSocketClient):
-
-    def __init__(self, zunclient, url, exec_id, id, escape='~',
-                 close_wait=0.5):
-        super(ExecClient, self).__init__(zunclient, url, id, escape,
-                                         close_wait)
-        self.exec_id = exec_id
-
-    def tty_resize(self, height, width):
-        """Resize the tty session
-
-        Get the client and send the tty size data to zun api server
-        The environment variables need to get when implement sending
-        operation.
-        """
-        height = str(height)
-        width = str(width)
-
-        self.cs.containers.execute_resize(self.id, self.exec_id, width, height)
-
-
 class WINCHHandler(object):
     """WINCH Signal handler
 
@@ -385,23 +364,6 @@ def do_attach(zunclient, url, container_id, escape, close_wait):
             wscls = AttachClient(zunclient=zunclient, url=url,
                                  id=container_id, escape=escape,
                                  close_wait=close_wait)
-            wscls.connect()
-            wscls.handle_resize()
-            wscls.start_loop()
-        except exceptions.ContainerWebSocketException as e:
-            print("%(e)s:%(container)s" %
-                  {'e': e, 'container': container_id})
-    else:
-        raise exceptions.InvalidWebSocketLink(container_id)
-
-
-def do_exec(zunclient, url, container_id, exec_id, escape, close_wait):
-    if url.startswith("ws://") or url.startswith("wss://"):
-        try:
-            wscls = ExecClient(zunclient=zunclient, url=url,
-                               exec_id=exec_id,
-                               id=container_id, escape=escape,
-                               close_wait=close_wait)
             wscls.connect()
             wscls.handle_resize()
             wscls.start_loop()
