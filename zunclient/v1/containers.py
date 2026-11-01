@@ -13,6 +13,7 @@
 #    under the License.
 
 import io
+import os
 import posixpath
 import shlex
 import tarfile
@@ -21,6 +22,7 @@ from urllib import parse
 from zunclient import api_versions
 from zunclient.common import base
 from zunclient.common import utils
+from zunclient.common.websocketclient import exceptions as ws_exceptions
 from zunclient.common.websocketclient import k8s_exec
 from zunclient import exceptions
 
@@ -261,6 +263,49 @@ class ContainerManager(base.Manager):
                     "The archive of %s from container %s is cut off or "
                     "damaged" % (src_path, id))
             tar.extractall(dest_dir, filter=_copy_from_filter)
+
+    def copy_to(self, id, src_path, dest_dir):
+        """Copy a local file or directory into dest_dir in the container.
+
+        It streams a tar archive to tar in the container, so the files can
+        be any size. As with docker cp, the files belong to the user the
+        command runs as in the container, not to their local owner, and
+        symlinks are copied as links.
+
+        :raises CommandFailed: if tar in the container fails, for example
+            because dest_dir doesn't exist.
+        :raises OSError: if a local file can't be read. Files that tar in
+            the container extracted before it stay.
+        """
+        arcname = os.path.basename(os.path.normpath(src_path))
+        # -o: don't give the files their local owner.
+        args = ['tar', 'xof', '-', '-C', dest_dir]
+        stdout, stderr = [], []
+        session = self.execute_session(id, args, stdin=PIPE,
+                                       stdout=stdout.append,
+                                       stderr=stderr.append)
+        try:
+            try:
+                with tarfile.open(fileobj=session.stdin, mode='w|') as tar:
+                    tar.add(src_path, arcname=arcname)
+                session.stdin.close()
+            except ws_exceptions.Disconnected:
+                # tar exited before reading everything, for example
+                # because dest_dir doesn't exist. Its exit code says
+                # whether that matters: it may not read all the padding.
+                pass
+            except Exception:
+                # Close tar's input, so that it doesn't wait for the rest.
+                try:
+                    session.stdin.close()
+                except ws_exceptions.Disconnected:
+                    pass
+                raise
+            returncode = session.wait()
+        finally:
+            session.close()
+        CommandResult(id, args, returncode, b''.join(stdout),
+                      b''.join(stderr)).check_returncode()
 
     def execute_session(self, id, args, stdin=None, stdout=None, stderr=None,
                         tty=False):

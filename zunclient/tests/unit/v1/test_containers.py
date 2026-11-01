@@ -23,6 +23,7 @@ from testtools import matchers
 from urllib import parse
 from zunclient import api_versions
 from zunclient.common import utils as zun_utils
+from zunclient.common.websocketclient import exceptions as ws_exceptions
 from zunclient.common.websocketclient import k8s_exec
 from zunclient import exceptions
 from zunclient.tests.unit import utils
@@ -1084,3 +1085,130 @@ class CopyFromTest(testtools.TestCase):
             '1234', [], 0, data[:3000], b'')
         self.assertRaises(tarfile.ReadError,
                           self.mgr.copy_from, '1234', 'f', self.dest)
+
+
+class FakeUpload(object):
+    """An ExecSession for tar xf - in a container, which keeps its stdin.
+
+    Use start() as execute_session(). With reads=n, the "command" exits
+    after reading n bytes, so later writes raise Disconnected.
+    """
+
+    def __init__(self, returncode=0, stderr=b'', reads=None):
+        self.returncode = returncode
+        self._stderr = stderr
+        self.received = _FakeStdin(reads)
+        self.write_sizes = self.received.sizes
+        self.closed = False
+
+    def start(self, id, args, stdin=None, stdout=None, stderr=None):
+        assert stdin == k8s_exec.PIPE
+        self.args = args
+        self._stderr_sink = stderr
+        self.stdin = io.BufferedWriter(self.received, k8s_exec.CHUNK_SIZE)
+        return self
+
+    def wait(self):
+        if self._stderr:
+            self._stderr_sink(self._stderr)
+        return self.returncode
+
+    def close(self):
+        self.closed = True
+
+    def members(self):
+        """The names and contents in the archive that arrived."""
+        data = io.BytesIO(self.received.data.getvalue())
+        with tarfile.open(fileobj=data) as tar:
+            return {m.name: tar.extractfile(m).read() if m.isfile() else None
+                    for m in tar.getmembers()}
+
+
+class _FakeStdin(io.RawIOBase):
+
+    def __init__(self, reads):
+        super(_FakeStdin, self).__init__()
+        self._reads = reads
+        self.data = io.BytesIO()
+        self.sizes = []
+
+    def writable(self):
+        return True
+
+    def write(self, data):
+        if (self._reads is not None and
+                self.data.tell() + len(data) > self._reads):
+            raise ws_exceptions.Disconnected(message='closed')
+        self.sizes.append(len(data))
+        return self.data.write(data)
+
+
+class CopyToTest(testtools.TestCase):
+
+    def setUp(self):
+        super(CopyToTest, self).setUp()
+        self.mgr = containers.ContainerManager(utils.FakeAPI({}))
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp)
+
+    def copy_to(self, upload, src, dest='/srv'):
+        with mock.patch.object(self.mgr, 'execute_session',
+                               side_effect=upload.start):
+            self.mgr.copy_to('1234', src, dest)
+
+    def write(self, name, data):
+        path = os.path.join(self.tmp, name)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, 'wb') as f:
+            f.write(data)
+        return path
+
+    def test_copy_to_file(self):
+        upload = FakeUpload()
+        self.copy_to(upload, self.write('a.txt', b'hello\n'))
+        self.assertEqual(['tar', 'xof', '-', '-C', '/srv'], upload.args)
+        self.assertEqual({'a.txt': b'hello\n'}, upload.members())
+        self.assertTrue(upload.received.closed)  # tar saw the end
+        self.assertTrue(upload.closed)
+
+    def test_copy_to_directory(self):
+        self.write('data/sub/b.txt', b'b')
+        upload = FakeUpload()
+        self.copy_to(upload, os.path.join(self.tmp, 'data') + '/')
+        self.assertEqual({'data': None, 'data/sub': None,
+                          'data/sub/b.txt': b'b'}, upload.members())
+
+    def test_copy_to_streams(self):
+        # The archive goes out as it is made, in pieces no bigger than a
+        # websocket message, instead of all at once.
+        upload = FakeUpload()
+        self.copy_to(upload, self.write('big', b'x' * (1 << 20)))
+        self.assertGreater(len(upload.write_sizes), 10)
+        self.assertLessEqual(max(upload.write_sizes), k8s_exec.CHUNK_SIZE)
+
+    def test_copy_to_tar_fails(self):
+        src = self.write('a.txt', b'x' * 100000)
+        stderr = b'tar: /missing: No such file or directory\n'
+        upload = FakeUpload(returncode=2, stderr=stderr, reads=0)
+        e = self.assertRaises(exceptions.CommandFailed, self.copy_to,
+                              upload, src, '/missing')
+        self.assertEqual(2, e.returncode)
+        self.assertEqual(stderr, e.stderr)
+        self.assertTrue(upload.closed)
+
+    def test_copy_to_tar_exits_before_the_padding(self):
+        # tar may exit once it has read the end of the archive, before the
+        # padding that fills out the last record.
+        upload = FakeUpload(reads=2048)
+        self.copy_to(upload, self.write('a.txt', b'a'))
+        self.assertTrue(upload.closed)
+
+    def test_copy_to_local_read_error_closes_stdin(self):
+        src = self.write('a.txt', b'a')
+        os.chmod(src, 0)
+        if os.access(src, os.R_OK):
+            self.skipTest('running as root')
+        upload = FakeUpload()
+        self.assertRaises(PermissionError, self.copy_to, upload, self.tmp)
+        self.assertTrue(upload.received.closed)
+        self.assertTrue(upload.closed)
