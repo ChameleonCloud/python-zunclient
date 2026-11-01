@@ -12,7 +12,6 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import io
 import os
 import posixpath
 import shlex
@@ -239,30 +238,46 @@ class ContainerManager(base.Manager):
     def copy_from(self, id, src_path, dest_dir):
         """Copy a file or directory from the container into dest_dir.
 
-        It runs tar in the container and holds the archive in memory.
+        It runs tar in the container and extracts its archive as it
+        arrives, so the files can be any size. Files extracted before an
+        error stay.
 
         :raises CommandFailed: if tar in the container fails, for example
             because src_path doesn't exist.
         :raises tarfile.FilterError: if a file would land outside dest_dir.
-            Files extracted before it stay.
-        :raises tarfile.ReadError: if the archive is incomplete. Nothing is
-            extracted then.
+        :raises tarfile.ReadError: if the archive is cut off or damaged.
         """
         parent, name = posixpath.split(posixpath.normpath(src_path))
-        result = self.execute_run(
-            id, ['tar', 'cf', '-', '-C', parent or '.', name or '.'],
-            check=True)
-        with tarfile.open(fileobj=io.BytesIO(result.stdout)) as tar:
-            tar.getmembers()
-            # tar ends an archive with at least 1024 zero bytes. tarfile
-            # stops without an error at a damaged header, so check that
-            # everything after the last member is zeros.
-            rest = result.stdout[tar.offset:]
-            if len(rest) < 1024 or any(rest):
-                raise tarfile.ReadError(
-                    "The archive of %s from container %s is cut off or "
-                    "damaged" % (src_path, id))
-            tar.extractall(dest_dir, filter=_copy_from_filter)
+        args = ['tar', 'cf', '-', '-C', parent or '.', name or '.']
+        stderr = []
+        session = self.execute_session(id, args, stdout=PIPE,
+                                       stderr=stderr.append)
+        try:
+            archive = _ArchiveStream(session.stdout)
+            try:
+                with tarfile.open(fileobj=archive, mode='r|') as tar:
+                    tar.extractall(dest_dir, filter=_copy_from_filter)
+                    end = tar.offset
+                archive.read_to_end()
+                # tar ends an archive with at least 1024 zero bytes.
+                # tarfile stops without an error at a damaged header, so
+                # check that everything after the last member is zeros.
+                if archive.length - end < 1024 or archive.last_data >= end:
+                    raise tarfile.ReadError("no end-of-archive marker")
+            except tarfile.ReadError as e:
+                # If tar failed, that is the error to report.
+                read_error = e
+            else:
+                read_error = None
+            returncode = session.wait()
+        finally:
+            session.close()
+        CommandResult(id, args, returncode, b'',
+                      b''.join(stderr)).check_returncode()
+        if read_error is not None:
+            raise tarfile.ReadError(
+                "The archive of %s from container %s is cut off or "
+                "damaged: %s" % (src_path, id, read_error))
 
     def copy_to(self, id, src_path, dest_dir):
         """Copy a local file or directory into dest_dir in the container.
@@ -441,6 +456,31 @@ class ContainerManager(base.Manager):
     def remove_security_group(self, id, security_group):
         return self._action(id, '/remove_security_group',
                             qparams={'name': security_group})
+
+
+class _ArchiveStream(object):
+    """Reads a tar archive for tarfile, and notes where its data ends.
+
+    :ivar length: how many bytes have been read.
+    :ivar last_data: the offset of the last byte that isn't zero, or -1.
+    """
+
+    def __init__(self, f):
+        self._f = f
+        self.length = 0
+        self.last_data = -1
+
+    def read(self, size=-1):
+        data = self._f.read(size)
+        stripped = len(data.rstrip(b'\0'))
+        if stripped:
+            self.last_data = self.length + stripped - 1
+        self.length += len(data)
+        return data
+
+    def read_to_end(self):
+        while self.read(k8s_exec.CHUNK_SIZE):
+            pass
 
 
 def _copy_from_filter(member, dest_path):

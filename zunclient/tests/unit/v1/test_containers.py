@@ -26,6 +26,7 @@ from zunclient.common import utils as zun_utils
 from zunclient.common.websocketclient import exceptions as ws_exceptions
 from zunclient.common.websocketclient import k8s_exec
 from zunclient import exceptions
+from zunclient.tests.unit import test_k8s_exec
 from zunclient.tests.unit import utils
 from zunclient.v1 import containers
 
@@ -994,7 +995,32 @@ def archive_end(data):
         return tar.offset
 
 
-@mock.patch.object(containers.ContainerManager, 'execute_run')
+class FakeDownload(object):
+    """An ExecSession for tar cf - in a container: its stdout is data.
+
+    Use start() as execute_session().
+    """
+
+    def __init__(self, data=b'', returncode=0, stderr=b''):
+        self.stdout = io.BytesIO(data)
+        self.returncode = returncode
+        self._stderr = stderr
+        self.closed = False
+
+    def start(self, id, args, stdin=None, stdout=None, stderr=None):
+        assert stdin is None and stdout == k8s_exec.PIPE
+        self.args = args
+        if self._stderr:
+            stderr(self._stderr)
+        return self
+
+    def wait(self):
+        return self.returncode
+
+    def close(self):
+        self.closed = True
+
+
 class CopyFromTest(testtools.TestCase):
 
     def setUp(self):
@@ -1005,86 +1031,130 @@ class CopyFromTest(testtools.TestCase):
         self.dest = os.path.join(self.tmp, 'dest')
         os.mkdir(self.dest)
 
-    def archive(self, execute_run, *members):
-        execute_run.return_value = containers.CommandResult(
-            '1234', [], 0, tar_archive(*members), b'')
+    def copy_from(self, download, src='f'):
+        with mock.patch.object(self.mgr, 'execute_session',
+                               side_effect=download.start):
+            self.mgr.copy_from('1234', src, self.dest)
 
-    def test_copy_from(self, execute_run):
-        self.archive(
-            execute_run,
+    def test_copy_from(self):
+        download = FakeDownload(tar_archive(
             member('data', type=tarfile.DIRTYPE, mode=0o755),
             member('data/a.txt', b'hello\n'),
             member('data/b.txt', type=tarfile.LNKTYPE, linkname='data/a.txt'),
-            member('data/bin', type=tarfile.SYMTYPE, linkname='/usr/bin'))
-        self.mgr.copy_from('1234', '/srv/data/', self.dest)
-        execute_run.assert_called_once_with(
-            '1234', ['tar', 'cf', '-', '-C', '/srv', 'data'], check=True)
+            member('data/bin', type=tarfile.SYMTYPE, linkname='/usr/bin')))
+        self.copy_from(download, '/srv/data/')
+        self.assertEqual(['tar', 'cf', '-', '-C', '/srv', 'data'],
+                         download.args)
         data = os.path.join(self.dest, 'data')
         with open(os.path.join(data, 'a.txt'), 'rb') as f:
             self.assertEqual(b'hello\n', f.read())
         with open(os.path.join(data, 'b.txt'), 'rb') as f:
             self.assertEqual(b'hello\n', f.read())
         self.assertEqual('/usr/bin', os.readlink(os.path.join(data, 'bin')))
+        self.assertTrue(download.closed)
 
-    def test_copy_from_root(self, execute_run):
-        self.archive(execute_run)
-        self.mgr.copy_from('1234', '/', self.dest)
-        execute_run.assert_called_once_with(
-            '1234', ['tar', 'cf', '-', '-C', '/', '.'], check=True)
+    def test_copy_from_root(self):
+        download = FakeDownload(tar_archive())
+        self.copy_from(download, '/')
+        self.assertEqual(['tar', 'cf', '-', '-C', '/', '.'], download.args)
 
-    def test_copy_from_refuses_path_outside_dest(self, execute_run):
-        self.archive(execute_run, member('../escape.txt', b'x'))
+    def test_copy_from_extracts_as_the_archive_arrives(self):
+        data = tar_archive(member('a.txt', b'a'),
+                           member('b.txt', b'b' * 50000))
+        a = os.path.join(self.dest, 'a.txt')
+        download = FakeDownload(data)
+        read = download.stdout.read
+        seen = []
+
+        def read_and_look(size=-1):
+            # Before the end of the archive has been read, a.txt is there.
+            if download.stdout.tell() > 40000:
+                seen.append(os.path.exists(a))
+            return read(size)
+        download.stdout.read = read_and_look
+        self.copy_from(download)
+        self.assertTrue(seen)
+        self.assertTrue(all(seen))
+
+    def test_copy_from_refuses_path_outside_dest(self):
+        download = FakeDownload(tar_archive(member('../escape.txt', b'x')))
         self.assertRaises(tarfile.OutsideDestinationError,
-                          self.mgr.copy_from, '1234', 'f', self.dest)
+                          self.copy_from, download)
         self.assertFalse(
             os.path.exists(os.path.join(self.tmp, 'escape.txt')))
+        self.assertTrue(download.closed)
 
-    def test_copy_from_refuses_hard_link_outside_dest(self, execute_run):
+    def test_copy_from_refuses_hard_link_outside_dest(self):
         outside = os.path.join(self.tmp, 'outside.txt')
         with open(outside, 'w') as f:
             f.write('original')
         # A link to a file outside dest, then a file written through it.
-        self.archive(
-            execute_run,
+        download = FakeDownload(tar_archive(
             member('x', type=tarfile.LNKTYPE, linkname='../outside.txt'),
-            member('x', b'PWNED'))
+            member('x', b'PWNED')))
         self.assertRaises(tarfile.LinkOutsideDestinationError,
-                          self.mgr.copy_from, '1234', 'f', self.dest)
+                          self.copy_from, download)
         with open(outside) as f:
             self.assertEqual('original', f.read())
 
-    def test_copy_from_tar_fails(self, execute_run):
-        execute_run.side_effect = exceptions.CommandFailed(
-            '1234', [], 2, b'', b'tar: nope: No such file or directory\n')
-        self.assertRaises(exceptions.CommandFailed,
-                          self.mgr.copy_from, '1234', 'nope', self.dest)
+    def test_copy_from_tar_fails(self):
+        stderr = b'tar: nope: No such file or directory\n'
+        # GNU tar still writes an empty archive; BusyBox writes nothing.
+        for data in (tar_archive(), b''):
+            download = FakeDownload(data, returncode=2, stderr=stderr)
+            e = self.assertRaises(exceptions.CommandFailed,
+                                  self.copy_from, download, 'nope')
+            self.assertEqual(2, e.returncode)
+            self.assertEqual(stderr, e.stderr)
+            self.assertTrue(download.closed)
 
-    def test_copy_from_cut_off_between_files(self, execute_run):
+    def test_copy_from_tar_fails_after_a_cut_off_archive(self):
+        data = tar_archive(member('a.txt', b'a' * 5000))
+        download = FakeDownload(data[:3000], returncode=1)
+        self.assertRaises(exceptions.CommandFailed, self.copy_from, download)
+
+    def test_copy_from_cut_off_between_files(self):
         data = tar_archive(member('a.txt', b'a'), member('b.txt', b'b'))
-        execute_run.return_value = containers.CommandResult(
-            '1234', [], 0, data[:archive_end(data)], b'')
-        e = self.assertRaises(tarfile.ReadError,
-                              self.mgr.copy_from, '1234', 'f', self.dest)
+        e = self.assertRaises(tarfile.ReadError, self.copy_from,
+                              FakeDownload(data[:archive_end(data)]))
         self.assertIn('cut off or damaged', str(e))
-        self.assertEqual([], os.listdir(self.dest))
+        # Files extracted before the error stay.
+        self.assertEqual(['a.txt', 'b.txt'], sorted(os.listdir(self.dest)))
 
-    def test_copy_from_damaged_header(self, execute_run):
+    def test_copy_from_damaged_header(self):
         data = bytearray(tar_archive(member('a.txt', b'a'),
                                      member('b.txt', b'b')))
         # Damage the second member's header, so tarfile stops before it.
         data[1024 + 100] ^= 0xff
-        execute_run.return_value = containers.CommandResult(
-            '1234', [], 0, bytes(data), b'')
-        self.assertRaises(tarfile.ReadError,
-                          self.mgr.copy_from, '1234', 'f', self.dest)
-        self.assertEqual([], os.listdir(self.dest))
+        self.assertRaises(tarfile.ReadError, self.copy_from,
+                          FakeDownload(bytes(data)))
+        self.assertEqual(['a.txt'], os.listdir(self.dest))
 
-    def test_copy_from_cut_off_inside_a_file(self, execute_run):
+    def test_copy_from_cut_off_inside_a_file(self):
         data = tar_archive(member('a.txt', b'a' * 5000))
-        execute_run.return_value = containers.CommandResult(
-            '1234', [], 0, data[:3000], b'')
-        self.assertRaises(tarfile.ReadError,
-                          self.mgr.copy_from, '1234', 'f', self.dest)
+        e = self.assertRaises(tarfile.ReadError, self.copy_from,
+                              FakeDownload(data[:3000]))
+        self.assertIn('cut off or damaged', str(e))
+
+    def test_copy_from_empty_output(self):
+        self.assertRaises(tarfile.ReadError, self.copy_from,
+                          FakeDownload(b''))
+
+    def test_copy_from_through_an_exec_session(self):
+        # The archive arrives in websocket messages of any size.
+        data = tar_archive(member('a.txt', os.urandom(300000)))
+        messages = [(test_k8s_exec.BINARY, b'\x01' + data[i:i + 7000])
+                    for i in range(0, len(data), 7000)]
+        ws = test_k8s_exec.FakeWebSocket(
+            *messages + [test_k8s_exec.SUCCESS, test_k8s_exec.CLOSE])
+
+        def start(id, args, stdout=None, stderr=None):
+            return k8s_exec.ExecSession(ws, stdout=stdout, stderr=stderr)
+        with mock.patch.object(self.mgr, 'execute_session',
+                               side_effect=start):
+            self.mgr.copy_from('1234', 'a.txt', self.dest)
+        with open(os.path.join(self.dest, 'a.txt'), 'rb') as f:
+            self.assertTrue(f.read() == data[512:512 + 300000])
 
 
 class FakeUpload(object):
@@ -1212,3 +1282,24 @@ class CopyToTest(testtools.TestCase):
         self.assertRaises(PermissionError, self.copy_to, upload, self.tmp)
         self.assertTrue(upload.received.closed)
         self.assertTrue(upload.closed)
+
+    def test_copy_to_through_an_exec_session(self):
+        # The "command" exits once its stdin is closed.
+        class Tar(test_k8s_exec.FakeWebSocket):
+            def send_binary(self, data):
+                super(Tar, self).send_binary(data)
+                if data == b'\xff\x00':
+                    self.receive(test_k8s_exec.SUCCESS, test_k8s_exec.CLOSE)
+        ws = Tar()
+
+        def start(id, args, stdin=None, stdout=None, stderr=None):
+            return k8s_exec.ExecSession(ws, stdin=stdin, stdout=stdout,
+                                        stderr=stderr)
+        content = os.urandom(300000)
+        with mock.patch.object(self.mgr, 'execute_session',
+                               side_effect=start):
+            self.mgr.copy_to('1234', self.write('a.txt', content), '/srv')
+        self.assertEqual(b'\xff\x00', ws.sent[-1])
+        received = b''.join(m[1:] for m in ws.sent[:-1])
+        with tarfile.open(fileobj=io.BytesIO(received)) as tar:
+            self.assertTrue(tar.extractfile('a.txt').read() == content)
