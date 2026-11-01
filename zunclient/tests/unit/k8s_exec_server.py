@@ -69,6 +69,7 @@ class ExecServer(object):
 class _Connection(object):
 
     def __init__(self, sock):
+        self.pings = 0
         self._sock = sock
         self._file = sock.makefile('rb')
 
@@ -93,6 +94,7 @@ class _Connection(object):
         while True:
             opcode, data = self._recv()
             if opcode == _PING:
+                self.pings += 1
                 self.send(_PONG, data)
             elif data[:1] == b'\x00':
                 return data[1:]

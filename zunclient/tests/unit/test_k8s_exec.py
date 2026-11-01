@@ -59,6 +59,7 @@ class FakeWebSocket(object):
     def __init__(self, *messages):
         self._incoming = queue.Queue()
         self.sent = []
+        self.pings = 0
         self.shut_down = False
         self.sock = _FakeSocket(self)
         self.receive(*messages)
@@ -81,6 +82,11 @@ class FakeWebSocket(object):
     def send_close(self):
         self.sent.append('close')
         self.receive(CLOSE)
+
+    def ping(self):
+        if self.shut_down:
+            raise websocket.WebSocketConnectionClosedException()
+        self.pings += 1
 
     def shutdown(self):
         self.shut_down = True
@@ -471,6 +477,47 @@ class PipeTest(testtools.TestCase):
         self.assertIsNone(session.stderr)
 
 
+@mock.patch.object(k8s_exec, 'PING_INTERVAL', 0.001)
+class PingTest(testtools.TestCase):
+
+    def wait_for_pings(self, ws, n):
+        for _ in range(int(TIMEOUT / 0.001)):
+            if ws.pings >= n:
+                return
+            threading.Event().wait(0.001)
+        self.fail('only %d pings' % ws.pings)
+
+    def test_pings_while_running(self):
+        ws = FakeWebSocket()
+        session = k8s_exec.ExecSession(ws)
+        self.addCleanup(session.close, timeout=0)
+        self.wait_for_pings(ws, 3)
+        self.assertEqual([], ws.sent)  # pings aren't data
+
+    def test_stops_when_the_session_ends(self):
+        ws = FakeWebSocket(SUCCESS, CLOSE)
+        session = k8s_exec.ExecSession(ws)
+        session.wait(TIMEOUT)
+        session._pinger.join(TIMEOUT)
+        self.assertFalse(session._pinger.is_alive())
+
+    def test_stops_when_a_ping_fails(self):
+        ws = FakeWebSocket()
+        session = k8s_exec.ExecSession(ws)
+        self.addCleanup(session.close, timeout=0)
+        ws.shut_down = True
+        session._pinger.join(TIMEOUT)
+        self.assertFalse(session._pinger.is_alive())
+
+    def test_no_ping_before_the_interval(self):
+        with mock.patch.object(k8s_exec, 'PING_INTERVAL', 60):
+            ws = FakeWebSocket()
+            session = k8s_exec.ExecSession(ws)
+            self.addCleanup(session.close, timeout=0)
+            threading.Event().wait(0.05)
+            self.assertEqual(0, ws.pings)
+
+
 class CloseTest(testtools.TestCase):
 
     def test_close_running_session(self):
@@ -555,6 +602,24 @@ class RealSocketTest(testtools.TestCase):
         session.close(timeout=0.1)
         session._reader.join(TIMEOUT)
         self.assertFalse(session._reader.is_alive())
+
+    @mock.patch.object(k8s_exec, 'PING_INTERVAL', 0.01)
+    def test_pings_while_the_command_is_quiet(self):
+        # The server answers each ping with a pong, which the reader must
+        # skip over.
+        connections = []
+
+        def quiet_cat(conn):
+            connections.append(conn)
+            return self._cat(conn)
+        server = k8s_exec_server.ExecServer(quiet_cat)
+        session = k8s_exec.connect(server.url)
+        self.addCleanup(session.close, timeout=0)
+        threading.Event().wait(0.2)
+        self.assertEqual((b'late', b''),
+                         session.communicate(b'late', timeout=TIMEOUT))
+        server.join()
+        self.assertGreater(connections[0].pings, 0)
 
     def test_stream_file_to_file(self):
         def upper(conn):

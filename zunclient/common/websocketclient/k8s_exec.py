@@ -25,6 +25,8 @@ How a session works:
 * Any thread may write: send(), close_stdin() and resize(), or the stdin
   pipe.
 * wait() blocks until the reader has finished and returns the exit code.
+* A ping thread sends a websocket ping every PING_INTERVAL seconds, so that
+  proxies don't cut a session that is quiet for a long time.
 
 Because something is always reading, a command can't stall with its output
 unread while the client is still writing its input. To pipe a large stream
@@ -65,6 +67,11 @@ CHUNK_SIZE = 64 * 1024
 # How many output messages recv() may fall behind before the reader waits.
 # A full queue slows the command down rather than filling memory.
 QUEUE_SIZE = 64
+
+# Seconds between keepalive pings. Proxies close connections that carry
+# nothing for a while, such as HAProxy after its client and server
+# timeouts, even while a command is running.
+PING_INTERVAL = 30
 
 _END = object()  # put on the queue after the last output message
 
@@ -174,6 +181,9 @@ class ExecSession(object):
         self._reader = threading.Thread(target=self._read,
                                         name='k8s-exec-reader', daemon=True)
         self._reader.start()
+        self._pinger = threading.Thread(target=self._ping,
+                                        name='k8s-exec-ping', daemon=True)
+        self._pinger.start()
 
     def _reader_for(self, channel):
         pipe = self._pipes.get(channel)
@@ -263,6 +273,14 @@ class ExecSession(object):
         if self.exit_code is None:
             raise SessionError(self.status, self._ended)
         return self.exit_code
+
+    def _ping(self):
+        while not self._done.wait(PING_INTERVAL):
+            try:
+                self._ws.ping()
+            except (OSError, websocket.WebSocketException):
+                # The connection has ended; the reader reports how.
+                return
 
     # Writing. Any thread may call these.
 
