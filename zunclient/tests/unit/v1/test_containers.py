@@ -628,7 +628,7 @@ class ContainerManagerTest(testtools.TestCase):
         ]
         self.assertEqual(expect, self.api.calls)
         connect.assert_called_once_with('ws://proxy.example:6784/?token=t',
-                                        stdout=None, stderr=None)
+                                        stdin=None, stdout=None, stderr=None)
         connect.return_value.communicate.assert_called_once_with(
             None, timeout=None)
         self.assertEqual(CONTAINER1['command'], result.args)
@@ -684,6 +684,8 @@ class ContainerManagerTest(testtools.TestCase):
         result = mgr.execute_run(CONTAINER1['id'], ['cat'], input=b'in',
                                  timeout=10)
         self.assertEqual(b'in', result.stdout)
+        connect.assert_called_once_with('ws://p/', stdin=k8s_exec.PIPE,
+                                        stdout=None, stderr=None)
         session.communicate.assert_called_once_with(b'in', timeout=10)
 
     @mock.patch('zunclient.common.websocketclient.k8s_exec.connect')
@@ -694,19 +696,71 @@ class ContainerManagerTest(testtools.TestCase):
                           CONTAINER1['id'], CONTAINER1['command'], timeout=1)
         session.close.assert_called_once_with()
 
+    def _execute_session(self, connect, version='1.42', **qparams):
+        url = self._execute_url(command='cat', run=False, **qparams)
+        api = utils.FakeAPI({url: {'POST': ({}, {'proxy_url': 'ws://p/'})}})
+        api.api_version = api_versions.APIVersion(version)
+        return containers.ContainerManager(api), api
+
     @mock.patch('zunclient.common.websocketclient.k8s_exec.connect')
     def test_containers_execute_session(self, connect):
-        url = self._execute_url(command='cat', run=False, interactive=True,
-                                tty=False)
-        api = utils.FakeAPI({url: {'POST': ({}, {'proxy_url': 'ws://p/'})}})
-        mgr = containers.ContainerManager(api)
+        mgr, api = self._execute_session(connect, interactive=True,
+                                         tty=False)
         out = []
         session = mgr.execute_session(CONTAINER1['id'], ['cat'],
-                                      stdout=out.append,
-                                      interactive=True, tty=False)
-        connect.assert_called_once_with('ws://p/', stdout=out.append,
-                                        stderr=None)
+                                      stdin=k8s_exec.PIPE, stdout=out.append)
+        connect.assert_called_once_with('ws://p/', stdin=k8s_exec.PIPE,
+                                        stdout=out.append, stderr=None)
         self.assertIs(connect.return_value, session)
+        self.assertEqual(1, len(api.calls))
+
+    @mock.patch('zunclient.common.websocketclient.k8s_exec.connect')
+    def test_containers_execute_session_pipe(self, connect):
+        mgr, api = self._execute_session(connect, interactive=True,
+                                         tty=False)
+        mgr.execute_session(CONTAINER1['id'], ['cat'], stdin=containers.PIPE,
+                            stdout=containers.PIPE)
+        connect.assert_called_once_with('ws://p/', stdin=k8s_exec.PIPE,
+                                        stdout=k8s_exec.PIPE, stderr=None)
+
+    @mock.patch('zunclient.common.websocketclient.k8s_exec.connect')
+    def test_containers_execute_session_without_stdin(self, connect):
+        mgr, api = self._execute_session(connect)
+        mgr.execute_session(CONTAINER1['id'], ['cat'])
+        self.assertEqual(1, len(api.calls))
+
+    @mock.patch('zunclient.common.websocketclient.k8s_exec.connect')
+    def test_containers_execute_session_tty(self, connect):
+        mgr, api = self._execute_session(connect, interactive=True,
+                                         tty=True)
+        mgr.execute_session(CONTAINER1['id'], ['cat'], stdin=k8s_exec.PIPE,
+                            tty=True)
+        self.assertEqual(1, len(api.calls))
+
+    @mock.patch('zunclient.common.websocketclient.k8s_exec.connect')
+    def test_containers_execute_session_tty_without_stdin(self, connect):
+        mgr, api = self._execute_session(connect, tty=True)
+        mgr.execute_session(CONTAINER1['id'], ['cat'], tty=True)
+        self.assertEqual(1, len(api.calls))
+
+    @mock.patch('zunclient.common.websocketclient.k8s_exec.connect')
+    def test_containers_execute_session_tty_before_1_42(self, connect):
+        # Before 1.42, interactive means stdin and a terminal.
+        mgr, api = self._execute_session(connect, '1.41', interactive=True)
+        mgr.execute_session(CONTAINER1['id'], ['cat'], stdin=k8s_exec.PIPE,
+                            tty=True)
+        self.assertEqual(1, len(api.calls))
+
+    @mock.patch('zunclient.common.websocketclient.k8s_exec.connect')
+    def test_containers_execute_session_needs_1_42(self, connect):
+        mgr, api = self._execute_session(connect, '1.41')
+        for kwargs in ({'stdin': k8s_exec.PIPE}, {'tty': True}):
+            e = self.assertRaises(exceptions.UnsupportedVersion,
+                                  mgr.execute_session, CONTAINER1['id'],
+                                  ['cat'], **kwargs)
+            self.assertIn('1.42', str(e))
+        self.assertEqual([], api.calls)
+        connect.assert_not_called()
 
     def _execute_url(self, **qparams):
         return '/v1/containers/%s/execute?%s' % (CONTAINER1['id'],

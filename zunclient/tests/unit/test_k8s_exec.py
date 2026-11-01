@@ -362,6 +362,115 @@ class WriteTest(testtools.TestCase):
         self.assertEqual([], self.ws.sent)
 
 
+class PipeTest(testtools.TestCase):
+
+    def test_stdout_pipe(self):
+        session = k8s_exec.ExecSession(
+            FakeWebSocket(OPEN_OUT, OUT, (BINARY, b'\x01more\nlast'),
+                          SUCCESS, CLOSE),
+            stdout=k8s_exec.PIPE)
+        self.assertEqual(b'out\n', session.stdout.readline())
+        self.assertEqual([b'more\n', b'last'], list(session.stdout))
+        self.assertEqual(b'', session.stdout.read())  # the end, and stays
+        self.assertEqual(0, session.wait(TIMEOUT))
+
+    def test_read_all_of_a_pipe(self):
+        session = k8s_exec.ExecSession(
+            FakeWebSocket(*[OUT] * (k8s_exec.QUEUE_SIZE * 2) +
+                          [SUCCESS, CLOSE]),
+            stdout=k8s_exec.PIPE, stderr=k8s_exec.PIPE)
+        self.assertEqual(b'out\n' * k8s_exec.QUEUE_SIZE * 2,
+                         session.stdout.read())
+        self.assertEqual(b'', session.stderr.read())
+
+    def test_stderr_pipe_and_recv(self):
+        # A piped channel is not in recv(), as with a sink.
+        session = k8s_exec.ExecSession(
+            FakeWebSocket(OUT, ERR, EXIT_3, CLOSE), stderr=k8s_exec.PIPE)
+        self.assertIsNone(session.stdout)
+        self.assertEqual((k8s_exec.STDOUT, b'out\n'), session.recv(TIMEOUT))
+        self.assertIsNone(session.recv(TIMEOUT))
+        self.assertEqual(b'err\n', session.stderr.read())
+        self.assertEqual(3, session.exit_code)
+
+    def test_unread_pipe_holds_the_command_back(self):
+        # Like any pipe: the reader waits for room, so the exit code
+        # doesn't arrive until the output is read.
+        ws = FakeWebSocket(*[OUT] * (k8s_exec.QUEUE_SIZE + 10) +
+                           [SUCCESS, CLOSE])
+        session = k8s_exec.ExecSession(ws, stdout=k8s_exec.PIPE)
+        self.assertRaises(k8s_exec.ExecTimeout, session.wait, 0.05)
+        session.stdout.read()
+        self.assertEqual(0, session.wait(TIMEOUT))
+
+    def test_close_ends_pipe_and_frees_reader(self):
+        ws = FakeWebSocket(*[OUT] * (k8s_exec.QUEUE_SIZE + 10))
+        session = k8s_exec.ExecSession(ws, stdout=k8s_exec.PIPE)
+        pipe = session._pipes[k8s_exec.STDOUT]
+        while pipe._chunks.qsize() < k8s_exec.QUEUE_SIZE:
+            threading.Event().wait(0.001)
+        session.close(timeout=TIMEOUT)
+        session._reader.join(TIMEOUT)
+        self.assertFalse(session._reader.is_alive())
+        self.assertEqual(b'', session.stdout.read())
+
+    def test_close_wakes_a_blocked_pipe_reader(self):
+        session = k8s_exec.ExecSession(FakeWebSocket(), stdout=k8s_exec.PIPE)
+        result = []
+        reader = threading.Thread(
+            target=lambda: result.append(session.stdout.read()), daemon=True)
+        reader.start()
+        threading.Event().wait(0.01)
+        session.close(timeout=TIMEOUT)
+        reader.join(TIMEOUT)
+        self.assertEqual([b''], result)
+
+    def test_stdin_pipe_is_buffered(self):
+        ws = FakeWebSocket()
+        session = k8s_exec.ExecSession(ws, stdin=k8s_exec.PIPE)
+        self.addCleanup(session.close, timeout=0)
+        session.stdin.write(b'a')
+        session.stdin.write(b'b')
+        self.assertEqual([], ws.sent)
+        session.stdin.flush()
+        self.assertEqual([b'\x00ab'], ws.sent)
+        session.stdin.write(b'c')
+        session.stdin.close()
+        self.assertEqual([b'\x00ab', b'\x00c', b'\xff\x00'], ws.sent)
+
+    def test_stdin_pipe_large_write(self):
+        ws = FakeWebSocket()
+        session = k8s_exec.ExecSession(ws, stdin=k8s_exec.PIPE)
+        self.addCleanup(session.close, timeout=0)
+        data = b'z' * (k8s_exec.CHUNK_SIZE * 3 + 5)
+        with session.stdin:
+            session.stdin.write(data)
+        self.assertEqual(data, b''.join(m[1:] for m in ws.sent[:-1]))
+        self.assertTrue(all(len(m) <= k8s_exec.CHUNK_SIZE + 1
+                            for m in ws.sent))
+        self.assertEqual(b'\xff\x00', ws.sent[-1])
+
+    def test_stdin_pipe_write_after_exit_raises_disconnected(self):
+        ws = FakeWebSocket(EXIT_3, CLOSE)
+        session = k8s_exec.ExecSession(ws, stdin=k8s_exec.PIPE)
+        session.wait(TIMEOUT)
+        session.stdin.write(b'unread')
+        self.assertRaises(exceptions.Disconnected, session.stdin.flush)
+
+    def test_stdin_pipe_close_after_exit_sends_nothing(self):
+        ws = FakeWebSocket(EXIT_3, CLOSE)
+        session = k8s_exec.ExecSession(ws, stdin=k8s_exec.PIPE)
+        session.wait(TIMEOUT)
+        session.stdin.close()
+        self.assertEqual([], ws.sent)
+
+    def test_no_pipes_by_default(self):
+        session = k8s_exec.ExecSession(FakeWebSocket(SUCCESS, CLOSE))
+        self.assertIsNone(session.stdin)
+        self.assertIsNone(session.stdout)
+        self.assertIsNone(session.stderr)
+
+
 class CloseTest(testtools.TestCase):
 
     def test_close_running_session(self):
@@ -466,3 +575,24 @@ class RealSocketTest(testtools.TestCase):
         server.join()
         self.assertEqual(b'ABC' * 100000, out.getvalue())
         self.assertEqual(b'done\n', err.getvalue())
+
+    def test_pipe_through_cat(self):
+        # Write on one thread and read on another, as with subprocess pipes.
+        server = k8s_exec_server.ExecServer(self._cat)
+        session = k8s_exec.connect(server.url, stdin=k8s_exec.PIPE,
+                                   stdout=k8s_exec.PIPE)
+        self.addCleanup(session.close, timeout=0)
+        data = bytes(range(256)) * 4096 * 4  # 4 MiB
+
+        def write():
+            with session.stdin:
+                for start in range(0, len(data), 1000):
+                    session.stdin.write(data[start:start + 1000])
+        writer = threading.Thread(target=write, daemon=True)
+        writer.start()
+        received = session.stdout.read()
+        writer.join(TIMEOUT)
+        server.join()
+        self.assertEqual(0, session.wait(TIMEOUT))
+        self.assertEqual(len(data), len(received))
+        self.assertTrue(received == data)

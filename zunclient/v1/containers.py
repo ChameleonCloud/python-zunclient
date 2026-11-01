@@ -34,6 +34,10 @@ CREATION_ATTRIBUTES = ['name', 'image', 'command', 'cpu', 'memory',
                        'exposed_ports', 'healthcheck', 'registry', 'tty',
                        'host', 'device_profiles', 'entrypoint']
 
+# For execute_session(): open a pipe to the command's stdin, stdout or
+# stderr. See k8s_exec.PIPE.
+PIPE = k8s_exec.PIPE
+
 
 class CommandResult(object):
     """A command that ran in a container and exited."""
@@ -219,10 +223,8 @@ class ContainerManager(base.Manager):
         :raises k8s_exec.ExecTimeout: if the command ran longer than
             timeout, with the output so far.
         """
-        kwargs = {}
-        if input is not None:
-            kwargs.update(interactive=True, tty=False)
-        session = self.execute_session(id, args, **kwargs)
+        stdin = PIPE if input is not None else None
+        session = self.execute_session(id, args, stdin=stdin)
         try:
             stdout, stderr = session.communicate(input, timeout=timeout)
         finally:
@@ -260,28 +262,48 @@ class ContainerManager(base.Manager):
                     "damaged" % (src_path, id))
             tar.extractall(dest_dir, filter=_copy_from_filter)
 
-    def execute_session(self, id, args, stdout=None, stderr=None, **kwargs):
+    def execute_session(self, id, args, stdin=None, stdout=None, stderr=None,
+                        tty=False):
         """Start a command over a websocket; return its ExecSession.
 
         :param args: a list of arguments, or a command line (no shell).
+        :param stdin: PIPE, to give the command a stdin: write to it with
+            session.stdin, or with send() and close_stdin(). If None, the
+            command has no stdin.
         :param stdout: where stdout goes as it arrives: a function that
-            takes bytes, or a binary file. If None, read it from the session
-            with recv() or communicate().
+            takes bytes, a binary file, or PIPE, for a pipe to read as
+            session.stdout. If None, read it from the session with recv() or
+            communicate().
         :param stderr: the same, for stderr. With a tty, stderr is part of
             stdout.
-        :param kwargs: passed to execute(), such as interactive=True for
-            stdin, and tty=False for stdin without a terminal.
+        :param tty: if True, run the command in a terminal, as for
+            docker exec -t. Set its size with resize().
+        :raises exceptions.UnsupportedVersion: if the server's API is older
+            than 1.42 and the command has stdin without a terminal, or a
+            terminal without stdin. Before 1.42, stdin always comes with
+            a terminal.
         """
         command = args
         if not isinstance(command, str):
             # The server splits the command with shlex.split, which undoes
             # shlex.join exactly.
             command = shlex.join(command)
+        kwargs = {}
+        if stdin is not None:
+            kwargs['interactive'] = True
+        if self.api_version >= api_versions.APIVersion("1.42"):
+            if stdin is not None or tty:
+                kwargs['tty'] = tty
+        elif (stdin is not None) != bool(tty):
+            raise exceptions.UnsupportedVersion(
+                "Zun API %s runs a command with stdin only in a terminal, "
+                "and in a terminal only with stdin; 1.42 or later allows "
+                "either alone." % self.api_version.get_string())
         # Instead of running when the REST API returns, the command begins
         # execution when the websocket connects.
         response = self.execute(id, command=command, run=False, **kwargs)
-        return k8s_exec.connect(response['proxy_url'], stdout=stdout,
-                                stderr=stderr)
+        return k8s_exec.connect(response['proxy_url'], stdin=stdin,
+                                stdout=stdout, stderr=stderr)
 
     def _process_execute_tty(self, kwargs):
         tty_microversion = api_versions.APIVersion("1.42")
