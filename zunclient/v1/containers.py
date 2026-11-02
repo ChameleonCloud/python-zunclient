@@ -13,6 +13,7 @@
 #    under the License.
 
 import io
+import os
 import posixpath
 import shlex
 import tarfile
@@ -259,6 +260,27 @@ class ContainerManager(base.Manager):
                     "The archive of %s from container %s is cut off or "
                     "damaged" % (src_path, id))
             tar.extractall(dest_dir, filter=_copy_from_filter)
+
+    def copy_to(self, id, src_path, dest_dir):
+        """Copy a local file or directory into dest_dir in the container.
+
+        It runs tar in the container and holds the archive in memory.
+
+        :raises CommandFailed: if tar in the container fails, for example
+            because dest_dir doesn't exist.
+        """
+
+        # tar creates each file's archive name under dest_dir
+        # set arcname so /home/foo/data/ -> dest_dir/data instead of
+        # dest_dir/home/foo/data
+        arcname = os.path.basename(os.path.abspath(src_path))
+        data = io.BytesIO()
+        with tarfile.open(fileobj=data, mode='w') as tar:
+            tar.add(src_path, arcname=arcname)
+        # -o: leave files owned by the container's user, instead of the
+        # uid:gid on the source files. TODO(shermanm) make this configurable
+        self.execute_run(id, ['tar', 'xof', '-', '-C', dest_dir],
+                         input=data.getvalue(), check=True)
 
     def execute_session(self, id, args, stdout=None, stderr=None, **kwargs):
         """Start a command over a websocket; return its ExecSession.

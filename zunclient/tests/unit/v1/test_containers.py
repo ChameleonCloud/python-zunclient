@@ -1030,3 +1030,53 @@ class CopyFromTest(testtools.TestCase):
             '1234', [], 0, data[:3000], b'')
         self.assertRaises(tarfile.ReadError,
                           self.mgr.copy_from, '1234', 'f', self.dest)
+
+
+@mock.patch.object(containers.ContainerManager, 'execute_run')
+class CopyToTest(testtools.TestCase):
+
+    def setUp(self):
+        super().setUp()
+        self.mgr = containers.ContainerManager(utils.FakeAPI({}))
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp)
+
+    def test_copy_to_tar_command(self, execute_run):
+        src = os.path.join(self.tmp, 'a.txt')
+        with open(src, 'w') as f:
+            f.write('hello')
+        self.mgr.copy_to('1234', src, 'dest_dir')
+        execute_run.assert_called_once_with(
+            '1234', ['tar', 'xof', '-', '-C', 'dest_dir'],
+            input=mock.ANY, check=True)
+
+    def test_copy_to_arcname_is_file_name(self, execute_run):
+        src = os.path.join(self.tmp, 'a.txt')
+        with open(src, 'w') as f:
+            f.write('hello')
+        self.mgr.copy_to('1234', src, 'dest_dir')
+        archive = execute_run.call_args.kwargs['input']
+        with tarfile.open(fileobj=io.BytesIO(archive)) as tar:
+            self.assertEqual(['a.txt'], tar.getnames())
+
+    def test_copy_to_arcname_ignores_trailing_slash(self, execute_run):
+        src = os.path.join(self.tmp, 'data')
+        os.mkdir(src)
+        with open(os.path.join(src, 'a.txt'), 'w') as f:
+            f.write('hello')
+        self.mgr.copy_to('1234', src + '/', 'dest_dir')
+        archive = execute_run.call_args.kwargs['input']
+        with tarfile.open(fileobj=io.BytesIO(archive)) as tar:
+            self.assertEqual(['data', 'data/a.txt'], tar.getnames())
+
+    def test_copy_to_arcname_of_dot_is_directory_name(self, execute_run):
+        src = os.path.join(self.tmp, 'data')
+        os.mkdir(src)
+        with open(os.path.join(src, 'a.txt'), 'w') as f:
+            f.write('hello')
+        self.addCleanup(os.chdir, os.getcwd())
+        os.chdir(src)
+        self.mgr.copy_to('1234', '.', 'dest_dir')
+        archive = execute_run.call_args.kwargs['input']
+        with tarfile.open(fileobj=io.BytesIO(archive)) as tar:
+            self.assertEqual(['data', 'data/a.txt'], tar.getnames())
