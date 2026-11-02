@@ -19,6 +19,7 @@ from unittest import mock
 import testtools
 import websocket
 
+from zunclient.common.websocketclient import exceptions
 from zunclient.common.websocketclient import k8s_exec
 
 
@@ -57,12 +58,16 @@ class FakeWebSocket(object):
             self.messages.put(message)
         self.sock = mock.Mock()
         self.shut_down = False
+        self.sent = []
 
     def recv_data(self):
         message = self.messages.get()
         if isinstance(message, Exception):
             raise message
         return message
+
+    def send_binary(self, data):
+        self.sent.append(data)
 
     def send_close(self):
         self.messages.put(CLOSE)
@@ -185,3 +190,27 @@ class ExecSessionTest(testtools.TestCase):
         session.close()
         self.assertRaises(k8s_exec.SessionError, session.wait, TIMEOUT)
         ws.sock.shutdown.assert_called_once_with(socket.SHUT_RDWR)
+
+    def test_send_splits_large_writes(self):
+        ws = FakeWebSocket()
+        session = k8s_exec.ExecSession(ws)
+        self.addCleanup(session.close, timeout=0)
+        session.send(b'a' * k8s_exec.MAX_MESSAGE_SIZE + b'b')
+        self.assertEqual([b'\x00' + b'a' * k8s_exec.MAX_MESSAGE_SIZE,
+                          b'\x00b'], ws.sent)
+
+    def test_close_stdin(self):
+        ws = FakeWebSocket()
+        session = k8s_exec.ExecSession(ws)
+        self.addCleanup(session.close, timeout=0)
+        session.close_stdin()
+        self.assertEqual([b'\xff\x00'], ws.sent)
+
+    def test_send_after_connection_closed_raises(self):
+        for error in (websocket.WebSocketConnectionClosedException('closed'),
+                      BrokenPipeError(32, 'Broken pipe')):
+            ws = FakeWebSocket()
+            ws.send_binary = mock.Mock(side_effect=error)
+            session = k8s_exec.ExecSession(ws)
+            self.addCleanup(session.close, timeout=0)
+            self.assertRaises(exceptions.Disconnected, session.send, b'x')

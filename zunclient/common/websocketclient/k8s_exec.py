@@ -30,9 +30,13 @@ LOG = logging.getLogger(__name__)
 
 V5_PROTOCOL = 'v5.channel.k8s.io'
 
+STDIN = 0
 STDOUT = 1
 STDERR = 2
 ERROR = 3   # JSON Status object, includes exit code for all commands.
+CLOSE = 255  # The payload is the channel to close.
+
+MAX_MESSAGE_SIZE = 64 * 1024
 
 
 class SessionError(exceptions.ContainerWebSocketException):
@@ -111,6 +115,28 @@ class ExecSession(object):
         if not_done:
             raise ExecTimeout(timeout)
         return self._exit_code.result()
+
+    def send(self, data):
+        """Write bytes to the command's stdin.
+
+        :raises exceptions.Disconnected: if the connection has closed.
+        """
+        view = memoryview(data)
+        for start in range(0, len(view), MAX_MESSAGE_SIZE):
+            self._send(STDIN, view[start:start + MAX_MESSAGE_SIZE])
+
+    def close_stdin(self):
+        """Close the command's stdin, so the command sees the end of input.
+
+        :raises exceptions.Disconnected: if the connection has closed.
+        """
+        self._send(CLOSE, bytes([STDIN]))
+
+    def _send(self, channel, payload):
+        try:
+            self._ws.send_binary(bytes([channel]) + bytes(payload))
+        except (OSError, websocket.WebSocketException) as e:
+            raise exceptions.Disconnected(e)
 
     def close(self, timeout=3):
         """End the session. The command keeps running if it hasn't exited.
