@@ -260,8 +260,10 @@ class ContainerManager(base.Manager):
             extracted then.
         """
         parent, name = posixpath.split(posixpath.normpath(src_path))
+        # "./" keeps a name that starts with "-" from being read as a tar
+        # option.
         result = self.execute_run(
-            id, ['tar', 'cf', '-', '-C', parent or '.', name or '.'],
+            id, ['tar', 'cf', '-', '-C', parent or '.', './' + (name or '.')],
             check=True)
         with tarfile.open(fileobj=io.BytesIO(result.stdout)) as tar:
             tar.getmembers()

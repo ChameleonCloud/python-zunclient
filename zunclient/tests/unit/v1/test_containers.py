@@ -993,7 +993,7 @@ class CopyFromTest(testtools.TestCase):
             member('data/bin', type=tarfile.SYMTYPE, linkname='/usr/bin'))
         self.mgr.copy_from('1234', '/srv/data/', self.dest)
         execute_run.assert_called_once_with(
-            '1234', ['tar', 'cf', '-', '-C', '/srv', 'data'], check=True)
+            '1234', ['tar', 'cf', '-', '-C', '/srv', './data'], check=True)
         data = os.path.join(self.dest, 'data')
         with open(os.path.join(data, 'a.txt'), 'rb') as f:
             self.assertEqual(b'hello\n', f.read())
@@ -1005,7 +1005,15 @@ class CopyFromTest(testtools.TestCase):
         self.archive(execute_run)
         self.mgr.copy_from('1234', '/', self.dest)
         execute_run.assert_called_once_with(
-            '1234', ['tar', 'cf', '-', '-C', '/', '.'], check=True)
+            '1234', ['tar', 'cf', '-', '-C', '/', './.'], check=True)
+
+    def test_copy_from_name_starting_with_dash(self, execute_run):
+        self.archive(execute_run, member('-data', b'x'))
+        self.mgr.copy_from('1234', '/srv/-data', self.dest)
+        execute_run.assert_called_once_with(
+            '1234', ['tar', 'cf', '-', '-C', '/srv', './-data'], check=True)
+        with open(os.path.join(self.dest, '-data'), 'rb') as f:
+            self.assertEqual(b'x', f.read())
 
     def test_copy_from_refuses_path_outside_dest(self, execute_run):
         self.archive(execute_run, member('../escape.txt', b'x'))
