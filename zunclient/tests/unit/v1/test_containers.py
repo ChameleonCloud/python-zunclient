@@ -611,8 +611,13 @@ class ContainerManagerTest(testtools.TestCase):
 
     def _execute_run(self, connect, args, exit_code=0, **kwargs):
         session = connect.return_value
-        session.read_all.return_value = (b'out\n', b'err\n')
-        session.exit_code = exit_code
+        session.wait.return_value = exit_code
+
+        def connect_and_run(url, stdout, stderr):
+            stdout.write(b'out\n')
+            stderr.write(b'err\n')
+            return session
+        connect.side_effect = connect_and_run
         return self.mgr.execute_run(CONTAINER1['id'], args, **kwargs)
 
     @mock.patch('zunclient.common.websocketclient.k8s_exec.connect')
@@ -627,7 +632,8 @@ class ContainerManagerTest(testtools.TestCase):
              {'Content-Length': '0'}, None)
         ]
         self.assertEqual(expect, self.api.calls)
-        connect.assert_called_once_with('ws://proxy.example:6784/?token=t')
+        connect.assert_called_once_with('ws://proxy.example:6784/?token=t',
+                                        stdout=mock.ANY, stderr=mock.ANY)
         self.assertEqual(CONTAINER1['command'], result.args)
         self.assertEqual(3, result.returncode)
         self.assertEqual(b'out\n', result.stdout)
@@ -664,7 +670,7 @@ class ContainerManagerTest(testtools.TestCase):
     @mock.patch('zunclient.common.websocketclient.k8s_exec.connect')
     def test_containers_execute_run_closes_on_error(self, connect):
         session = connect.return_value
-        session.read_all.side_effect = k8s_exec.SessionError()
+        session.wait.side_effect = k8s_exec.SessionError()
         self.assertRaises(k8s_exec.SessionError, self.mgr.execute_run,
                           CONTAINER1['id'], CONTAINER1['command'])
         session.close.assert_called_once_with()

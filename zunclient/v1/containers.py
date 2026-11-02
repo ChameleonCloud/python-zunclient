@@ -215,12 +215,14 @@ class ContainerManager(base.Manager):
         :raises k8s_exec.SessionError: if the session ended without the
             command's exit code, including when the program doesn't exist.
         """
-        session = self._exec_session(id, args)
+        stdout, stderr = io.BytesIO(), io.BytesIO()
+        session = self._exec_session(id, args, stdout=stdout, stderr=stderr)
         try:
-            stdout, stderr = session.read_all()
+            returncode = session.wait()
         finally:
             session.close()
-        result = CommandResult(id, args, session.exit_code, stdout, stderr)
+        result = CommandResult(id, args, returncode, stdout.getvalue(),
+                               stderr.getvalue())
         if check:
             result.check_returncode()
         return result
@@ -253,7 +255,7 @@ class ContainerManager(base.Manager):
                     "damaged" % (src_path, id))
             tar.extractall(dest_dir, filter=_copy_from_filter)
 
-    def _exec_session(self, id, args):
+    def _exec_session(self, id, args, stdout=None, stderr=None):
         """Start a command over a websocket; return its ExecSession."""
         command = args
         if not isinstance(command, str):
@@ -263,7 +265,8 @@ class ContainerManager(base.Manager):
         # Instead of running when the REST API returns, the command begins
         # execution when the websocket connects.
         response = self.execute(id, command=command, run=False)
-        return k8s_exec.connect(response['proxy_url'])
+        return k8s_exec.connect(response['proxy_url'], stdout=stdout,
+                                stderr=stderr)
 
     def _process_execute_tty(self, kwargs):
         tty_microversion = api_versions.APIVersion("1.42")
