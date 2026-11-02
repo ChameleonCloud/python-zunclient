@@ -23,8 +23,10 @@ from testtools import matchers
 from urllib import parse
 from zunclient import api_versions
 from zunclient.common import utils as zun_utils
+from zunclient.common.websocketclient import exceptions as ws_exceptions
 from zunclient.common.websocketclient import k8s_exec
 from zunclient import exceptions
+from zunclient.tests.unit import test_k8s_exec
 from zunclient.tests.unit import utils
 from zunclient.v1 import containers
 
@@ -611,7 +613,7 @@ class ContainerManagerTest(testtools.TestCase):
 
     def _execute_run(self, connect, args, exit_code=0, **kwargs):
         session = connect.return_value
-        session.read_all.return_value = (b'out\n', b'err\n')
+        session.communicate.return_value = (b'out\n', b'err\n')
         session.exit_code = exit_code
         return self.mgr.execute_run(CONTAINER1['id'], args, **kwargs)
 
@@ -627,7 +629,10 @@ class ContainerManagerTest(testtools.TestCase):
              {'Content-Length': '0'}, None)
         ]
         self.assertEqual(expect, self.api.calls)
-        connect.assert_called_once_with('ws://proxy.example:6784/?token=t')
+        connect.assert_called_once_with('ws://proxy.example:6784/?token=t',
+                                        stdin=None, stdout=None, stderr=None)
+        connect.return_value.communicate.assert_called_once_with(
+            None, timeout=None)
         self.assertEqual(CONTAINER1['command'], result.args)
         self.assertEqual(3, result.returncode)
         self.assertEqual(b'out\n', result.stdout)
@@ -664,10 +669,100 @@ class ContainerManagerTest(testtools.TestCase):
     @mock.patch('zunclient.common.websocketclient.k8s_exec.connect')
     def test_containers_execute_run_closes_on_error(self, connect):
         session = connect.return_value
-        session.read_all.side_effect = k8s_exec.SessionError()
+        session.communicate.side_effect = k8s_exec.SessionError()
         self.assertRaises(k8s_exec.SessionError, self.mgr.execute_run,
                           CONTAINER1['id'], CONTAINER1['command'])
         session.close.assert_called_once_with()
+
+    @mock.patch('zunclient.common.websocketclient.k8s_exec.connect')
+    def test_containers_execute_run_with_input(self, connect):
+        url = self._execute_url(command='cat', run=False, interactive=True,
+                                tty=False)
+        api = utils.FakeAPI({url: {'POST': ({}, {'proxy_url': 'ws://p/'})}})
+        mgr = containers.ContainerManager(api)
+        session = connect.return_value
+        session.communicate.return_value = (b'in', b'')
+        session.exit_code = 0
+        result = mgr.execute_run(CONTAINER1['id'], ['cat'], input=b'in',
+                                 timeout=10)
+        self.assertEqual(b'in', result.stdout)
+        connect.assert_called_once_with('ws://p/', stdin=k8s_exec.PIPE,
+                                        stdout=None, stderr=None)
+        session.communicate.assert_called_once_with(b'in', timeout=10)
+
+    @mock.patch('zunclient.common.websocketclient.k8s_exec.connect')
+    def test_containers_execute_run_closes_on_timeout(self, connect):
+        session = connect.return_value
+        session.communicate.side_effect = k8s_exec.ExecTimeout(1)
+        self.assertRaises(k8s_exec.ExecTimeout, self.mgr.execute_run,
+                          CONTAINER1['id'], CONTAINER1['command'], timeout=1)
+        session.close.assert_called_once_with()
+
+    def _execute_session(self, connect, version='1.42', **qparams):
+        url = self._execute_url(command='cat', run=False, **qparams)
+        api = utils.FakeAPI({url: {'POST': ({}, {'proxy_url': 'ws://p/'})}})
+        api.api_version = api_versions.APIVersion(version)
+        return containers.ContainerManager(api), api
+
+    @mock.patch('zunclient.common.websocketclient.k8s_exec.connect')
+    def test_containers_execute_session(self, connect):
+        mgr, api = self._execute_session(connect, interactive=True,
+                                         tty=False)
+        out = []
+        session = mgr.execute_session(CONTAINER1['id'], ['cat'],
+                                      stdin=k8s_exec.PIPE, stdout=out.append)
+        connect.assert_called_once_with('ws://p/', stdin=k8s_exec.PIPE,
+                                        stdout=out.append, stderr=None)
+        self.assertIs(connect.return_value, session)
+        self.assertEqual(1, len(api.calls))
+
+    @mock.patch('zunclient.common.websocketclient.k8s_exec.connect')
+    def test_containers_execute_session_pipe(self, connect):
+        mgr, api = self._execute_session(connect, interactive=True,
+                                         tty=False)
+        mgr.execute_session(CONTAINER1['id'], ['cat'], stdin=containers.PIPE,
+                            stdout=containers.PIPE)
+        connect.assert_called_once_with('ws://p/', stdin=k8s_exec.PIPE,
+                                        stdout=k8s_exec.PIPE, stderr=None)
+
+    @mock.patch('zunclient.common.websocketclient.k8s_exec.connect')
+    def test_containers_execute_session_without_stdin(self, connect):
+        mgr, api = self._execute_session(connect)
+        mgr.execute_session(CONTAINER1['id'], ['cat'])
+        self.assertEqual(1, len(api.calls))
+
+    @mock.patch('zunclient.common.websocketclient.k8s_exec.connect')
+    def test_containers_execute_session_tty(self, connect):
+        mgr, api = self._execute_session(connect, interactive=True,
+                                         tty=True)
+        mgr.execute_session(CONTAINER1['id'], ['cat'], stdin=k8s_exec.PIPE,
+                            tty=True)
+        self.assertEqual(1, len(api.calls))
+
+    @mock.patch('zunclient.common.websocketclient.k8s_exec.connect')
+    def test_containers_execute_session_tty_without_stdin(self, connect):
+        mgr, api = self._execute_session(connect, tty=True)
+        mgr.execute_session(CONTAINER1['id'], ['cat'], tty=True)
+        self.assertEqual(1, len(api.calls))
+
+    @mock.patch('zunclient.common.websocketclient.k8s_exec.connect')
+    def test_containers_execute_session_tty_before_1_42(self, connect):
+        # Before 1.42, interactive means stdin and a terminal.
+        mgr, api = self._execute_session(connect, '1.41', interactive=True)
+        mgr.execute_session(CONTAINER1['id'], ['cat'], stdin=k8s_exec.PIPE,
+                            tty=True)
+        self.assertEqual(1, len(api.calls))
+
+    @mock.patch('zunclient.common.websocketclient.k8s_exec.connect')
+    def test_containers_execute_session_needs_1_42(self, connect):
+        mgr, api = self._execute_session(connect, '1.41')
+        for kwargs in ({'stdin': k8s_exec.PIPE}, {'tty': True}):
+            e = self.assertRaises(exceptions.UnsupportedVersion,
+                                  mgr.execute_session, CONTAINER1['id'],
+                                  ['cat'], **kwargs)
+            self.assertIn('1.42', str(e))
+        self.assertEqual([], api.calls)
+        connect.assert_not_called()
 
     def _execute_url(self, **qparams):
         return '/v1/containers/%s/execute?%s' % (CONTAINER1['id'],
@@ -900,7 +995,32 @@ def archive_end(data):
         return tar.offset
 
 
-@mock.patch.object(containers.ContainerManager, 'execute_run')
+class FakeDownload(object):
+    """An ExecSession for tar cf - in a container: its stdout is data.
+
+    Use start() as execute_session().
+    """
+
+    def __init__(self, data=b'', returncode=0, stderr=b''):
+        self.stdout = io.BytesIO(data)
+        self.returncode = returncode
+        self._stderr = stderr
+        self.closed = False
+
+    def start(self, id, args, stdin=None, stdout=None, stderr=None):
+        assert stdin is None and stdout == k8s_exec.PIPE
+        self.args = args
+        if self._stderr:
+            stderr(self._stderr)
+        return self
+
+    def wait(self):
+        return self.returncode
+
+    def close(self):
+        self.closed = True
+
+
 class CopyFromTest(testtools.TestCase):
 
     def setUp(self):
@@ -911,83 +1031,275 @@ class CopyFromTest(testtools.TestCase):
         self.dest = os.path.join(self.tmp, 'dest')
         os.mkdir(self.dest)
 
-    def archive(self, execute_run, *members):
-        execute_run.return_value = containers.CommandResult(
-            '1234', [], 0, tar_archive(*members), b'')
+    def copy_from(self, download, src='f'):
+        with mock.patch.object(self.mgr, 'execute_session',
+                               side_effect=download.start):
+            self.mgr.copy_from('1234', src, self.dest)
 
-    def test_copy_from(self, execute_run):
-        self.archive(
-            execute_run,
+    def test_copy_from(self):
+        download = FakeDownload(tar_archive(
             member('data', type=tarfile.DIRTYPE, mode=0o755),
             member('data/a.txt', b'hello\n'),
             member('data/b.txt', type=tarfile.LNKTYPE, linkname='data/a.txt'),
-            member('data/bin', type=tarfile.SYMTYPE, linkname='/usr/bin'))
-        self.mgr.copy_from('1234', '/srv/data/', self.dest)
-        execute_run.assert_called_once_with(
-            '1234', ['tar', 'cf', '-', '-C', '/srv', 'data'], check=True)
+            member('data/bin', type=tarfile.SYMTYPE, linkname='/usr/bin')))
+        self.copy_from(download, '/srv/data/')
+        self.assertEqual(['tar', 'cf', '-', '-C', '/srv', 'data'],
+                         download.args)
         data = os.path.join(self.dest, 'data')
         with open(os.path.join(data, 'a.txt'), 'rb') as f:
             self.assertEqual(b'hello\n', f.read())
         with open(os.path.join(data, 'b.txt'), 'rb') as f:
             self.assertEqual(b'hello\n', f.read())
         self.assertEqual('/usr/bin', os.readlink(os.path.join(data, 'bin')))
+        self.assertTrue(download.closed)
 
-    def test_copy_from_root(self, execute_run):
-        self.archive(execute_run)
-        self.mgr.copy_from('1234', '/', self.dest)
-        execute_run.assert_called_once_with(
-            '1234', ['tar', 'cf', '-', '-C', '/', '.'], check=True)
+    def test_copy_from_root(self):
+        download = FakeDownload(tar_archive())
+        self.copy_from(download, '/')
+        self.assertEqual(['tar', 'cf', '-', '-C', '/', '.'], download.args)
 
-    def test_copy_from_refuses_path_outside_dest(self, execute_run):
-        self.archive(execute_run, member('../escape.txt', b'x'))
+    def test_copy_from_extracts_as_the_archive_arrives(self):
+        data = tar_archive(member('a.txt', b'a'),
+                           member('b.txt', b'b' * 50000))
+        a = os.path.join(self.dest, 'a.txt')
+        download = FakeDownload(data)
+        read = download.stdout.read
+        seen = []
+
+        def read_and_look(size=-1):
+            # Before the end of the archive has been read, a.txt is there.
+            if download.stdout.tell() > 40000:
+                seen.append(os.path.exists(a))
+            return read(size)
+        download.stdout.read = read_and_look
+        self.copy_from(download)
+        self.assertTrue(seen)
+        self.assertTrue(all(seen))
+
+    def test_copy_from_refuses_path_outside_dest(self):
+        download = FakeDownload(tar_archive(member('../escape.txt', b'x')))
         self.assertRaises(tarfile.OutsideDestinationError,
-                          self.mgr.copy_from, '1234', 'f', self.dest)
+                          self.copy_from, download)
         self.assertFalse(
             os.path.exists(os.path.join(self.tmp, 'escape.txt')))
+        self.assertTrue(download.closed)
 
-    def test_copy_from_refuses_hard_link_outside_dest(self, execute_run):
+    def test_copy_from_refuses_hard_link_outside_dest(self):
         outside = os.path.join(self.tmp, 'outside.txt')
         with open(outside, 'w') as f:
             f.write('original')
         # A link to a file outside dest, then a file written through it.
-        self.archive(
-            execute_run,
+        download = FakeDownload(tar_archive(
             member('x', type=tarfile.LNKTYPE, linkname='../outside.txt'),
-            member('x', b'PWNED'))
+            member('x', b'PWNED')))
         self.assertRaises(tarfile.LinkOutsideDestinationError,
-                          self.mgr.copy_from, '1234', 'f', self.dest)
+                          self.copy_from, download)
         with open(outside) as f:
             self.assertEqual('original', f.read())
 
-    def test_copy_from_tar_fails(self, execute_run):
-        execute_run.side_effect = exceptions.CommandFailed(
-            '1234', [], 2, b'', b'tar: nope: No such file or directory\n')
-        self.assertRaises(exceptions.CommandFailed,
-                          self.mgr.copy_from, '1234', 'nope', self.dest)
+    def test_copy_from_tar_fails(self):
+        stderr = b'tar: nope: No such file or directory\n'
+        # GNU tar still writes an empty archive; BusyBox writes nothing.
+        for data in (tar_archive(), b''):
+            download = FakeDownload(data, returncode=2, stderr=stderr)
+            e = self.assertRaises(exceptions.CommandFailed,
+                                  self.copy_from, download, 'nope')
+            self.assertEqual(2, e.returncode)
+            self.assertEqual(stderr, e.stderr)
+            self.assertTrue(download.closed)
 
-    def test_copy_from_cut_off_between_files(self, execute_run):
+    def test_copy_from_tar_fails_after_a_cut_off_archive(self):
+        data = tar_archive(member('a.txt', b'a' * 5000))
+        download = FakeDownload(data[:3000], returncode=1)
+        self.assertRaises(exceptions.CommandFailed, self.copy_from, download)
+
+    def test_copy_from_cut_off_between_files(self):
         data = tar_archive(member('a.txt', b'a'), member('b.txt', b'b'))
-        execute_run.return_value = containers.CommandResult(
-            '1234', [], 0, data[:archive_end(data)], b'')
-        e = self.assertRaises(tarfile.ReadError,
-                              self.mgr.copy_from, '1234', 'f', self.dest)
+        e = self.assertRaises(tarfile.ReadError, self.copy_from,
+                              FakeDownload(data[:archive_end(data)]))
         self.assertIn('cut off or damaged', str(e))
-        self.assertEqual([], os.listdir(self.dest))
+        # Files extracted before the error stay.
+        self.assertEqual(['a.txt', 'b.txt'], sorted(os.listdir(self.dest)))
 
-    def test_copy_from_damaged_header(self, execute_run):
+    def test_copy_from_damaged_header(self):
         data = bytearray(tar_archive(member('a.txt', b'a'),
                                      member('b.txt', b'b')))
         # Damage the second member's header, so tarfile stops before it.
         data[1024 + 100] ^= 0xff
-        execute_run.return_value = containers.CommandResult(
-            '1234', [], 0, bytes(data), b'')
-        self.assertRaises(tarfile.ReadError,
-                          self.mgr.copy_from, '1234', 'f', self.dest)
-        self.assertEqual([], os.listdir(self.dest))
+        self.assertRaises(tarfile.ReadError, self.copy_from,
+                          FakeDownload(bytes(data)))
+        self.assertEqual(['a.txt'], os.listdir(self.dest))
 
-    def test_copy_from_cut_off_inside_a_file(self, execute_run):
+    def test_copy_from_cut_off_inside_a_file(self):
         data = tar_archive(member('a.txt', b'a' * 5000))
-        execute_run.return_value = containers.CommandResult(
-            '1234', [], 0, data[:3000], b'')
-        self.assertRaises(tarfile.ReadError,
-                          self.mgr.copy_from, '1234', 'f', self.dest)
+        e = self.assertRaises(tarfile.ReadError, self.copy_from,
+                              FakeDownload(data[:3000]))
+        self.assertIn('cut off or damaged', str(e))
+
+    def test_copy_from_empty_output(self):
+        self.assertRaises(tarfile.ReadError, self.copy_from,
+                          FakeDownload(b''))
+
+    def test_copy_from_through_an_exec_session(self):
+        # The archive arrives in websocket messages of any size.
+        data = tar_archive(member('a.txt', os.urandom(300000)))
+        messages = [(test_k8s_exec.BINARY, b'\x01' + data[i:i + 7000])
+                    for i in range(0, len(data), 7000)]
+        ws = test_k8s_exec.FakeWebSocket(
+            *messages + [test_k8s_exec.SUCCESS, test_k8s_exec.CLOSE])
+
+        def start(id, args, stdout=None, stderr=None):
+            return k8s_exec.ExecSession(ws, stdout=stdout, stderr=stderr)
+        with mock.patch.object(self.mgr, 'execute_session',
+                               side_effect=start):
+            self.mgr.copy_from('1234', 'a.txt', self.dest)
+        with open(os.path.join(self.dest, 'a.txt'), 'rb') as f:
+            self.assertTrue(f.read() == data[512:512 + 300000])
+
+
+class FakeUpload(object):
+    """An ExecSession for tar xf - in a container, which keeps its stdin.
+
+    Use start() as execute_session(). With reads=n, the "command" exits
+    after reading n bytes, so later writes raise Disconnected.
+    """
+
+    def __init__(self, returncode=0, stderr=b'', reads=None):
+        self.returncode = returncode
+        self._stderr = stderr
+        self.received = _FakeStdin(reads)
+        self.write_sizes = self.received.sizes
+        self.closed = False
+
+    def start(self, id, args, stdin=None, stdout=None, stderr=None):
+        assert stdin == k8s_exec.PIPE
+        self.args = args
+        self._stderr_sink = stderr
+        self.stdin = io.BufferedWriter(self.received, k8s_exec.CHUNK_SIZE)
+        return self
+
+    def wait(self):
+        if self._stderr:
+            self._stderr_sink(self._stderr)
+        return self.returncode
+
+    def close(self):
+        self.closed = True
+
+    def members(self):
+        """The names and contents in the archive that arrived."""
+        data = io.BytesIO(self.received.data.getvalue())
+        with tarfile.open(fileobj=data) as tar:
+            return {m.name: tar.extractfile(m).read() if m.isfile() else None
+                    for m in tar.getmembers()}
+
+
+class _FakeStdin(io.RawIOBase):
+
+    def __init__(self, reads):
+        super(_FakeStdin, self).__init__()
+        self._reads = reads
+        self.data = io.BytesIO()
+        self.sizes = []
+
+    def writable(self):
+        return True
+
+    def write(self, data):
+        if (self._reads is not None and
+                self.data.tell() + len(data) > self._reads):
+            raise ws_exceptions.Disconnected(message='closed')
+        self.sizes.append(len(data))
+        return self.data.write(data)
+
+
+class CopyToTest(testtools.TestCase):
+
+    def setUp(self):
+        super(CopyToTest, self).setUp()
+        self.mgr = containers.ContainerManager(utils.FakeAPI({}))
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp)
+
+    def copy_to(self, upload, src, dest='/srv'):
+        with mock.patch.object(self.mgr, 'execute_session',
+                               side_effect=upload.start):
+            self.mgr.copy_to('1234', src, dest)
+
+    def write(self, name, data):
+        path = os.path.join(self.tmp, name)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, 'wb') as f:
+            f.write(data)
+        return path
+
+    def test_copy_to_file(self):
+        upload = FakeUpload()
+        self.copy_to(upload, self.write('a.txt', b'hello\n'))
+        self.assertEqual(['tar', 'xof', '-', '-C', '/srv'], upload.args)
+        self.assertEqual({'a.txt': b'hello\n'}, upload.members())
+        self.assertTrue(upload.received.closed)  # tar saw the end
+        self.assertTrue(upload.closed)
+
+    def test_copy_to_directory(self):
+        self.write('data/sub/b.txt', b'b')
+        upload = FakeUpload()
+        self.copy_to(upload, os.path.join(self.tmp, 'data') + '/')
+        self.assertEqual({'data': None, 'data/sub': None,
+                          'data/sub/b.txt': b'b'}, upload.members())
+
+    def test_copy_to_streams(self):
+        # The archive goes out as it is made, in pieces no bigger than a
+        # websocket message, instead of all at once.
+        upload = FakeUpload()
+        self.copy_to(upload, self.write('big', b'x' * (1 << 20)))
+        self.assertGreater(len(upload.write_sizes), 10)
+        self.assertLessEqual(max(upload.write_sizes), k8s_exec.CHUNK_SIZE)
+
+    def test_copy_to_tar_fails(self):
+        src = self.write('a.txt', b'x' * 100000)
+        stderr = b'tar: /missing: No such file or directory\n'
+        upload = FakeUpload(returncode=2, stderr=stderr, reads=0)
+        e = self.assertRaises(exceptions.CommandFailed, self.copy_to,
+                              upload, src, '/missing')
+        self.assertEqual(2, e.returncode)
+        self.assertEqual(stderr, e.stderr)
+        self.assertTrue(upload.closed)
+
+    def test_copy_to_tar_exits_before_the_padding(self):
+        # tar may exit once it has read the end of the archive, before the
+        # padding that fills out the last record.
+        upload = FakeUpload(reads=2048)
+        self.copy_to(upload, self.write('a.txt', b'a'))
+        self.assertTrue(upload.closed)
+
+    def test_copy_to_local_read_error_closes_stdin(self):
+        src = self.write('a.txt', b'a')
+        os.chmod(src, 0)
+        if os.access(src, os.R_OK):
+            self.skipTest('running as root')
+        upload = FakeUpload()
+        self.assertRaises(PermissionError, self.copy_to, upload, self.tmp)
+        self.assertTrue(upload.received.closed)
+        self.assertTrue(upload.closed)
+
+    def test_copy_to_through_an_exec_session(self):
+        # The "command" exits once its stdin is closed.
+        class Tar(test_k8s_exec.FakeWebSocket):
+            def send_binary(self, data):
+                super(Tar, self).send_binary(data)
+                if data == b'\xff\x00':
+                    self.receive(test_k8s_exec.SUCCESS, test_k8s_exec.CLOSE)
+        ws = Tar()
+
+        def start(id, args, stdin=None, stdout=None, stderr=None):
+            return k8s_exec.ExecSession(ws, stdin=stdin, stdout=stdout,
+                                        stderr=stderr)
+        content = os.urandom(300000)
+        with mock.patch.object(self.mgr, 'execute_session',
+                               side_effect=start):
+            self.mgr.copy_to('1234', self.write('a.txt', content), '/srv')
+        self.assertEqual(b'\xff\x00', ws.sent[-1])
+        received = b''.join(m[1:] for m in ws.sent[:-1])
+        with tarfile.open(fileobj=io.BytesIO(received)) as tar:
+            self.assertTrue(tar.extractfile('a.txt').read() == content)

@@ -1,0 +1,59 @@
+---
+features:
+  - |
+    Commands can run in a container over a websocket, through Zun's
+    websocket proxy, for as long as they need and with any amount of input
+    and output. This needs Zun's Kubernetes driver, as CHI@Edge runs.
+
+    * ``containers.execute_run()`` runs a command and waits for its exit
+      code and output, like ``subprocess.run``, with optional input and a
+      timeout.
+    * ``containers.execute_session()`` starts a command and returns an
+      ``ExecSession``, to read output as it arrives, write input as the
+      command runs, or run it in a terminal. stdin, stdout and stderr can
+      each be a pipe (``containers.PIPE``), and stdout and stderr a function
+      or a binary file.
+    * ``containers.copy_to()`` and ``containers.copy_from()`` copy files and
+      directories of any size into and out of a container, like
+      ``docker cp``, by streaming a tar archive through ``tar`` in the
+      container.
+
+    See "Running commands in a container" in the Python API guide.
+upgrade:
+  - |
+    ``openstack appcontainer cp`` and ``zun cp`` now copy with
+    ``copy_to()`` and ``copy_from()`` instead of the REST API's
+    ``put_archive`` and ``get_archive``, so they need Zun's Kubernetes
+    driver and its websocket proxy. Files of any size can be copied, and
+    a copy out of a container refuses files that would land outside the
+    destination.
+  - |
+    ``openstack appcontainer exec`` and ``zun exec`` without
+    ``--interactive`` now run the command over a websocket, so they need
+    Zun's Kubernetes driver and its websocket proxy. The command's stdout
+    and stderr arrive as it runs, on the client's stdout and stderr, with
+    no time limit; before, they were printed together after the command
+    exited, followed by a newline. ``openstack appcontainer exec`` exits
+    with the command's exit code, as before.
+  - |
+    ``openstack appcontainer exec --interactive`` and ``zun exec
+    --interactive`` now run the command in an exec session, like
+    ``docker exec -it`` and ``kubectl exec -it``. With a terminal, the
+    command's terminal takes our size and follows it, every key, Ctrl-C
+    included, goes to the command, and the client exits with the command's
+    exit code. With piped input, the command runs without a terminal, as
+    with kubectl, and sees the end of its input when ours ends. The
+    connection banner and the ``~.`` escape to disconnect are gone;
+    neither docker nor kubectl has them.
+  - |
+    websocket-client 1.1.0 or later is required.
+fixes:
+  - |
+    ``openstack appcontainer exec --interactive`` works with Zun's
+    Kubernetes driver. It spoke Docker's websocket protocol, which the
+    driver's exec proxy doesn't, and resized through the REST API, which
+    the driver ignores.
+  - |
+    ``openstack appcontainer cp`` into a container no longer hangs until
+    the request times out with Zun's Kubernetes driver, whose
+    ``put_archive`` never ends tar's input.

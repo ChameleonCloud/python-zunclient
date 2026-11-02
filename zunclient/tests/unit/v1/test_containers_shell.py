@@ -245,3 +245,18 @@ class ShellTest(shell_test_base.TestCommandLineArgument):
         mock_show.assert_called_once_with('container')
         mock_run.assert_called_with(
             **_get_container_args(image='x', hostname='testhost'))
+
+    @mock.patch('zunclient.common.utils.exec_command')
+    def test_zun_container_exec_success(self, mock_exec):
+        self._test_arg_success('exec x ls -l /')
+        mock_exec.assert_called_once_with(mock.ANY, 'x', ['ls', '-l', '/'])
+
+    @mock.patch('zunclient.v1.containers.ContainerManager.copy_from')
+    def test_zun_container_cp_from(self, mock_copy_from):
+        self._test_arg_success('cp x:/etc/hosts /tmp')
+        mock_copy_from.assert_called_once_with('x', '/etc/hosts', '/tmp')
+
+    @mock.patch('zunclient.v1.containers.ContainerManager.copy_to')
+    def test_zun_container_cp_to(self, mock_copy_to):
+        self._test_arg_success('cp /tmp/a x:/srv')
+        mock_copy_to.assert_called_once_with('x', '/tmp/a', '/srv')

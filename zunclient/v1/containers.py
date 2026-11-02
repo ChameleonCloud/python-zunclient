@@ -12,7 +12,7 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import io
+import os
 import posixpath
 import shlex
 import tarfile
@@ -21,6 +21,7 @@ from urllib import parse
 from zunclient import api_versions
 from zunclient.common import base
 from zunclient.common import utils
+from zunclient.common.websocketclient import exceptions as ws_exceptions
 from zunclient.common.websocketclient import k8s_exec
 from zunclient import exceptions
 
@@ -33,6 +34,10 @@ CREATION_ATTRIBUTES = ['name', 'image', 'command', 'cpu', 'memory',
                        'availability_zone', 'auto_heal', 'privileged',
                        'exposed_ports', 'healthcheck', 'registry', 'tty',
                        'host', 'device_profiles', 'entrypoint']
+
+# For execute_session(): open a pipe to the command's stdin, stdout or
+# stderr. See k8s_exec.PIPE.
+PIPE = k8s_exec.PIPE
 
 
 class CommandResult(object):
@@ -204,20 +209,25 @@ class ContainerManager(base.Manager):
         return self._action(id, '/execute',
                             qparams=kwargs)[1]
 
-    def execute_run(self, id, args, check=False):
+    def execute_run(self, id, args, check=False, input=None, timeout=None):
         """Run a command in the container and wait for it to exit.
-
-        There is no timeout.
 
         :param args: a list of arguments, or a command line (no shell).
         :param check: if True, raise CommandFailed on a nonzero exit code.
+        :param input: bytes, or a binary file, for the command's stdin. The
+            command sees the end of its input after the last byte.
+        :param timeout: seconds to wait for the command to exit. On a
+            timeout the session is closed; the command keeps running.
         :returns: a CommandResult, with stdout and stderr as bytes.
         :raises k8s_exec.SessionError: if the session ended without the
             command's exit code, including when the program doesn't exist.
+        :raises k8s_exec.ExecTimeout: if the command ran longer than
+            timeout, with the output so far.
         """
-        session = self._exec_session(id, args)
+        stdin = PIPE if input is not None else None
+        session = self.execute_session(id, args, stdin=stdin)
         try:
-            stdout, stderr = session.read_all()
+            stdout, stderr = session.communicate(input, timeout=timeout)
         finally:
             session.close()
         result = CommandResult(id, args, session.exit_code, stdout, stderr)
@@ -228,42 +238,132 @@ class ContainerManager(base.Manager):
     def copy_from(self, id, src_path, dest_dir):
         """Copy a file or directory from the container into dest_dir.
 
-        It runs tar in the container and holds the archive in memory.
+        It runs tar in the container and extracts its archive as it
+        arrives, so the files can be any size. Files extracted before an
+        error stay.
 
         :raises CommandFailed: if tar in the container fails, for example
             because src_path doesn't exist.
         :raises tarfile.FilterError: if a file would land outside dest_dir.
-            Files extracted before it stay.
-        :raises tarfile.ReadError: if the archive is incomplete. Nothing is
-            extracted then.
+        :raises tarfile.ReadError: if the archive is cut off or damaged.
         """
         parent, name = posixpath.split(posixpath.normpath(src_path))
-        result = self.execute_run(
-            id, ['tar', 'cf', '-', '-C', parent or '.', name or '.'],
-            check=True)
-        with tarfile.open(fileobj=io.BytesIO(result.stdout)) as tar:
-            tar.getmembers()
-            # tar ends an archive with at least 1024 zero bytes. tarfile
-            # stops without an error at a damaged header, so check that
-            # everything after the last member is zeros.
-            rest = result.stdout[tar.offset:]
-            if len(rest) < 1024 or any(rest):
-                raise tarfile.ReadError(
-                    "The archive of %s from container %s is cut off or "
-                    "damaged" % (src_path, id))
-            tar.extractall(dest_dir, filter=_copy_from_filter)
+        args = ['tar', 'cf', '-', '-C', parent or '.', name or '.']
+        stderr = []
+        session = self.execute_session(id, args, stdout=PIPE,
+                                       stderr=stderr.append)
+        try:
+            archive = _ArchiveStream(session.stdout)
+            try:
+                with tarfile.open(fileobj=archive, mode='r|') as tar:
+                    tar.extractall(dest_dir, filter=_copy_from_filter)
+                    end = tar.offset
+                archive.read_to_end()
+                # tar ends an archive with at least 1024 zero bytes.
+                # tarfile stops without an error at a damaged header, so
+                # check that everything after the last member is zeros.
+                if archive.length - end < 1024 or archive.last_data >= end:
+                    raise tarfile.ReadError("no end-of-archive marker")
+            except tarfile.ReadError as e:
+                # If tar failed, that is the error to report.
+                read_error = e
+            else:
+                read_error = None
+            returncode = session.wait()
+        finally:
+            session.close()
+        CommandResult(id, args, returncode, b'',
+                      b''.join(stderr)).check_returncode()
+        if read_error is not None:
+            raise tarfile.ReadError(
+                "The archive of %s from container %s is cut off or "
+                "damaged: %s" % (src_path, id, read_error))
 
-    def _exec_session(self, id, args):
-        """Start a command over a websocket; return its ExecSession."""
+    def copy_to(self, id, src_path, dest_dir):
+        """Copy a local file or directory into dest_dir in the container.
+
+        It streams a tar archive to tar in the container, so the files can
+        be any size. As with docker cp, the files belong to the user the
+        command runs as in the container, not to their local owner, and
+        symlinks are copied as links.
+
+        :raises CommandFailed: if tar in the container fails, for example
+            because dest_dir doesn't exist.
+        :raises OSError: if a local file can't be read. Files that tar in
+            the container extracted before it stay.
+        """
+        arcname = os.path.basename(os.path.normpath(src_path))
+        # -o: don't give the files their local owner.
+        args = ['tar', 'xof', '-', '-C', dest_dir]
+        stdout, stderr = [], []
+        session = self.execute_session(id, args, stdin=PIPE,
+                                       stdout=stdout.append,
+                                       stderr=stderr.append)
+        try:
+            try:
+                with tarfile.open(fileobj=session.stdin, mode='w|') as tar:
+                    tar.add(src_path, arcname=arcname)
+                session.stdin.close()
+            except ws_exceptions.Disconnected:
+                # tar exited before reading everything, for example
+                # because dest_dir doesn't exist. Its exit code says
+                # whether that matters: it may not read all the padding.
+                pass
+            except Exception:
+                # Close tar's input, so that it doesn't wait for the rest.
+                try:
+                    session.stdin.close()
+                except ws_exceptions.Disconnected:
+                    pass
+                raise
+            returncode = session.wait()
+        finally:
+            session.close()
+        CommandResult(id, args, returncode, b''.join(stdout),
+                      b''.join(stderr)).check_returncode()
+
+    def execute_session(self, id, args, stdin=None, stdout=None, stderr=None,
+                        tty=False):
+        """Start a command over a websocket; return its ExecSession.
+
+        :param args: a list of arguments, or a command line (no shell).
+        :param stdin: PIPE, to give the command a stdin: write to it with
+            session.stdin, or with send() and close_stdin(). If None, the
+            command has no stdin.
+        :param stdout: where stdout goes as it arrives: a function that
+            takes bytes, a binary file, or PIPE, for a pipe to read as
+            session.stdout. If None, read it from the session with recv() or
+            communicate().
+        :param stderr: the same, for stderr. With a tty, stderr is part of
+            stdout.
+        :param tty: if True, run the command in a terminal, as for
+            docker exec -t. Set its size with resize().
+        :raises exceptions.UnsupportedVersion: if the server's API is older
+            than 1.42 and the command has stdin without a terminal, or a
+            terminal without stdin. Before 1.42, stdin always comes with
+            a terminal.
+        """
         command = args
         if not isinstance(command, str):
             # The server splits the command with shlex.split, which undoes
             # shlex.join exactly.
             command = shlex.join(command)
+        kwargs = {}
+        if stdin is not None:
+            kwargs['interactive'] = True
+        if self.api_version >= api_versions.APIVersion("1.42"):
+            if stdin is not None or tty:
+                kwargs['tty'] = tty
+        elif (stdin is not None) != bool(tty):
+            raise exceptions.UnsupportedVersion(
+                "Zun API %s runs a command with stdin only in a terminal, "
+                "and in a terminal only with stdin; 1.42 or later allows "
+                "either alone." % self.api_version.get_string())
         # Instead of running when the REST API returns, the command begins
         # execution when the websocket connects.
-        response = self.execute(id, command=command, run=False)
-        return k8s_exec.connect(response['proxy_url'])
+        response = self.execute(id, command=command, run=False, **kwargs)
+        return k8s_exec.connect(response['proxy_url'], stdin=stdin,
+                                stdout=stdout, stderr=stderr)
 
     def _process_execute_tty(self, kwargs):
         tty_microversion = api_versions.APIVersion("1.42")
@@ -356,6 +456,31 @@ class ContainerManager(base.Manager):
     def remove_security_group(self, id, security_group):
         return self._action(id, '/remove_security_group',
                             qparams={'name': security_group})
+
+
+class _ArchiveStream(object):
+    """Reads a tar archive for tarfile, and notes where its data ends.
+
+    :ivar length: how many bytes have been read.
+    :ivar last_data: the offset of the last byte that isn't zero, or -1.
+    """
+
+    def __init__(self, f):
+        self._f = f
+        self.length = 0
+        self.last_data = -1
+
+    def read(self, size=-1):
+        data = self._f.read(size)
+        stripped = len(data.rstrip(b'\0'))
+        if stripped:
+            self.last_data = self.length + stripped - 1
+        self.length += len(data)
+        return data
+
+    def read_to_end(self):
+        while self.read(k8s_exec.CHUNK_SIZE):
+            pass
 
 
 def _copy_from_filter(member, dest_path):

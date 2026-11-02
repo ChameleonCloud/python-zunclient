@@ -11,11 +11,7 @@
 # under the License.
 
 import argparse
-from contextlib import closing
-import io
-import os
 from oslo_log import log as logging
-import tarfile
 import time
 
 from osc_lib.command import command
@@ -23,6 +19,7 @@ from osc_lib import utils
 
 from zunclient.common import utils as zun_utils
 from zunclient.common.websocketclient import exceptions
+from zunclient.common.websocketclient import terminal
 from zunclient.common.websocketclient import websocketclient
 from zunclient import exceptions as exc
 from zunclient.i18n import _
@@ -615,27 +612,17 @@ class ExecContainer(command.Command):
             dest='interactive',
             action='store_true',
             default=False,
-            help='Keep STDIN open and allocate a pseudo-TTY for interactive')
+            help='Keep STDIN open, and run the command in a terminal if '
+                 'STDIN is one.')
         return parser
 
     def take_action(self, parsed_args):
         client = _get_client(self, parsed_args)
         container = parsed_args.container
-        opts = {}
-        opts['command'] = zun_utils.parse_command(parsed_args.command)
         if parsed_args.interactive:
-            opts['interactive'] = True
-            opts['run'] = False
-        response = client.containers.execute(container, **opts)
-        if parsed_args.interactive:
-            exec_id = response['exec_id']
-            url = response['proxy_url']
-            websocketclient.do_exec(client, url, container, exec_id, "~", 0.5)
-        else:
-            output = response['output']
-            exit_code = response['exit_code']
-            print(output)
-            return exit_code
+            return terminal.exec_interactive(client, container,
+                                             parsed_args.command)
+        return zun_utils.exec_command(client, container, parsed_args.command)
 
 
 class LogsContainer(command.Command):
@@ -1162,38 +1149,12 @@ class CopyContainer(command.Command):
 
     def take_action(self, parsed_args):
         client = _get_client(self, parsed_args)
-        if ':' in parsed_args.source:
-            source_parts = parsed_args.source.split(':', 1)
-            container_id = source_parts[0]
-            container_path = source_parts[1]
-            opts = {}
-            opts['id'] = container_id
-            opts['path'] = container_path
-
-            res = client.containers.get_archive(**opts)
-            dest_path = parsed_args.destination
-            tardata = io.BytesIO(res['data'])
-            with closing(tarfile.open(fileobj=tardata)) as tar:
-                tar.extractall(dest_path)  # nosec
-
-        elif ':' in parsed_args.destination:
-            dest_parts = parsed_args.destination.split(':', 1)
-            container_id = dest_parts[0]
-            container_path = dest_parts[1]
-            filename = os.path.split(parsed_args.source)[1]
-            opts = {}
-            opts['id'] = container_id
-            opts['path'] = container_path
-            tardata = io.BytesIO()
-            with closing(tarfile.open(fileobj=tardata, mode='w')) as tar:
-                tar.add(parsed_args.source, arcname=filename)
-            opts['data'] = tardata.getvalue()
-            client.containers.put_archive(**opts)
-        else:
+        if not zun_utils.copy(client, parsed_args.source,
+                              parsed_args.destination):
             print("Please check the parameters for zun copy!")
             print("Usage:")
-            print("openstack appcontainer cp container:src_path dest_path|-")
-            print("openstack appcontainer cp src_path|- container:dest_path")
+            print("openstack appcontainer cp container:src_path dest_path")
+            print("openstack appcontainer cp src_path container:dest_path")
 
 
 class StatsContainer(command.ShowOne):
