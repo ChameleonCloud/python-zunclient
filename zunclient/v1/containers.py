@@ -21,6 +21,7 @@ from urllib import parse
 from zunclient import api_versions
 from zunclient.common import base
 from zunclient.common import utils
+from zunclient.common.websocketclient import exceptions as ws_exceptions
 from zunclient.common.websocketclient import k8s_exec
 from zunclient import exceptions
 
@@ -33,6 +34,8 @@ CREATION_ATTRIBUTES = ['name', 'image', 'command', 'cpu', 'memory',
                        'availability_zone', 'auto_heal', 'privileged',
                        'exposed_ports', 'healthcheck', 'registry', 'tty',
                        'host', 'device_profiles', 'entrypoint']
+
+PIPE = -1  # Like subprocess.PIPE.
 
 
 class CommandResult(object):
@@ -204,20 +207,36 @@ class ContainerManager(base.Manager):
         return self._action(id, '/execute',
                             qparams=kwargs)[1]
 
-    def execute_run(self, id, args, check=False):
+    def execute_run(self, id, args, check=False, input=None):
         """Run a command in the container and wait for it to exit.
-
-        There is no timeout.
 
         :param args: a list of arguments, or a command line (no shell).
         :param check: if True, raise CommandFailed on a nonzero exit code.
+        :param input: bytes to write to the command's stdin. If None, the
+            command has no stdin.
         :returns: a CommandResult, with stdout and stderr as bytes.
         :raises k8s_exec.SessionError: if the session ended without the
             command's exit code, including when the program doesn't exist.
+        :raises UnsupportedVersion: if input is given and the API version
+            is below 1.42.
         """
+        # Only request stin when there is input. Preserves no-stdin behavior
+        # when versions < 1.42 are specified.
+        stdin = None if input is None else PIPE
         stdout, stderr = io.BytesIO(), io.BytesIO()
-        session = self._exec_session(id, args, stdout=stdout, stderr=stderr)
+        session = self.execute_session(id, args, stdin=stdin, stdout=stdout,
+                                       stderr=stderr)
         try:
+            if input is not None:
+                try:
+                    session.send(input)
+                    session.close_stdin()
+                except ws_exceptions.Disconnected:
+                    # Raised if the command exits before reading all of stdin,
+                    # which is normal behavior.
+                    # Other connection drops will raise SessionError instead.
+                    # Callers should check the exit code received from wait().
+                    pass
             returncode = session.wait()
         finally:
             session.close()
@@ -255,16 +274,38 @@ class ContainerManager(base.Manager):
                     "damaged" % (src_path, id))
             tar.extractall(dest_dir, filter=_copy_from_filter)
 
-    def _exec_session(self, id, args, stdout=None, stderr=None):
-        """Start a command over a websocket; return its ExecSession."""
+    def execute_session(self, id, args, stdin=None, stdout=None, stderr=None):
+        """Start a command in the container and return a k8s_exec.ExecSession.
+
+        :param args: a list of arguments, or a command line.
+        :param stdin: PIPE to give the command a stdin, or None. The caller
+            writes to stdin with session.send() and closes it with
+            session.close_stdin().
+        :param stdout: a binary file object that receives the command's
+            standard output, or None to discard it.
+        :param stderr: the same, for standard error.
+        :raises UnsupportedVersion: if stdin is PIPE and the API version is
+            below 1.42.
+        """
         command = args
         if not isinstance(command, str):
             # The server splits the command with shlex.split, which undoes
             # shlex.join exactly.
             command = shlex.join(command)
+        qparams = {'command': command, 'run': False}
+        if stdin == PIPE:
+            if self.api_version < api_versions.APIVersion("1.42"):
+                # Before 1.42, interactive=True also gives the command a
+                # terminal.
+                raise exceptions.UnsupportedVersion(
+                    f"API version {self.api_version.get_string()} can't give "
+                    "a command stdin without a terminal. Use API version "
+                    "1.42 or later."
+                )
+            qparams['interactive'] = True
         # Instead of running when the REST API returns, the command begins
         # execution when the websocket connects.
-        response = self.execute(id, command=command, run=False)
+        response = self._action(id, '/execute', qparams=qparams)[1]
         return k8s_exec.connect(response['proxy_url'], stdout=stdout,
                                 stderr=stderr)
 

@@ -23,6 +23,7 @@ from testtools import matchers
 from urllib import parse
 from zunclient import api_versions
 from zunclient.common import utils as zun_utils
+from zunclient.common.websocketclient import exceptions as ws_exceptions
 from zunclient.common.websocketclient import k8s_exec
 from zunclient import exceptions
 from zunclient.tests.unit import utils
@@ -244,6 +245,16 @@ fake_responses = {
     '/v1/containers/%s/execute?%s'
     % (CONTAINER1['id'], parse.urlencode({'command': CONTAINER1['command'],
                                           'run': False})):
+    {
+        'POST': (
+            {},
+            {'proxy_url': 'ws://proxy.example:6784/?token=t'},
+        ),
+    },
+    '/v1/containers/%s/execute?%s'
+    % (CONTAINER1['id'], parse.urlencode({'command': CONTAINER1['command'],
+                                          'run': False,
+                                          'interactive': True})):
     {
         'POST': (
             {},
@@ -639,7 +650,8 @@ class ContainerManagerTest(testtools.TestCase):
         self.assertEqual(b'out\n', result.stdout)
         self.assertEqual(b'err\n', result.stderr)
         self.assertIn('returncode=3', repr(result))
-        connect.return_value.close.assert_called_once_with()
+        self.assertEqual([mock.call.wait(), mock.call.close()],
+                         connect.return_value.mock_calls)
 
     @mock.patch('zunclient.common.websocketclient.k8s_exec.connect')
     def test_containers_execute_run_list(self, connect):
@@ -674,6 +686,57 @@ class ContainerManagerTest(testtools.TestCase):
         self.assertRaises(k8s_exec.SessionError, self.mgr.execute_run,
                           CONTAINER1['id'], CONTAINER1['command'])
         session.close.assert_called_once_with()
+
+    @mock.patch('zunclient.common.websocketclient.k8s_exec.connect')
+    def test_containers_execute_run_sends_input_then_closes_stdin(self,
+                                                                  connect):
+        result = self._execute_run(connect, CONTAINER1['command'],
+                                   input=b'data')
+        self.assertEqual(
+            '/v1/containers/%s/execute?%s'
+            % (CONTAINER1['id'], parse.urlencode({
+                'command': CONTAINER1['command'], 'run': False,
+                'interactive': True})),
+            self.api.calls[0][1])
+        self.assertEqual([mock.call.send(b'data'), mock.call.close_stdin(),
+                          mock.call.wait(), mock.call.close()],
+                         connect.return_value.mock_calls)
+        self.assertEqual(0, result.returncode)
+
+    @mock.patch('zunclient.common.websocketclient.k8s_exec.connect')
+    def test_containers_execute_run_returns_result_on_broken_pipe(self,
+                                                                  connect):
+        session = connect.return_value
+        session.send.side_effect = ws_exceptions.Disconnected()
+        result = self._execute_run(connect, CONTAINER1['command'],
+                                   exit_code=2, input=b'data')
+        self.assertEqual(2, result.returncode)
+        self.assertEqual(b'err\n', result.stderr)
+        self.assertEqual([mock.call.send(b'data'), mock.call.wait(),
+                          mock.call.close()], session.mock_calls)
+
+    @mock.patch('zunclient.common.websocketclient.k8s_exec.connect')
+    def test_containers_execute_session_passes_output_files_to_connect(
+            self, connect):
+        stdout, stderr = io.BytesIO(), io.BytesIO()
+        session = self.mgr.execute_session(CONTAINER1['id'],
+                                           CONTAINER1['command'],
+                                           stdout=stdout, stderr=stderr)
+        connect.assert_called_once_with('ws://proxy.example:6784/?token=t',
+                                        stdout=stdout, stderr=stderr)
+        self.assertIs(connect.return_value, session)
+
+    @mock.patch('zunclient.common.websocketclient.k8s_exec.connect')
+    def test_containers_execute_session_refuses_stdin_before_1_42(
+            self, connect):
+        self.api.api_version = api_versions.APIVersion('1.41')
+        e = self.assertRaises(exceptions.UnsupportedVersion,
+                              self.mgr.execute_session, CONTAINER1['id'],
+                              'sh', stdin=containers.PIPE)
+        self.assertIn("API version 1.41 can't give a command stdin "
+                      "without a terminal", str(e))
+        self.assertEqual([], self.api.calls)
+        connect.assert_not_called()
 
     def _execute_url(self, **qparams):
         return '/v1/containers/%s/execute?%s' % (CONTAINER1['id'],

@@ -71,7 +71,8 @@ class ExecTimeout(exceptions.ContainerWebSocketException):
 def connect(url, stdout=None, stderr=None):
     """Connect to Zun's websocket proxy, which then starts the remote command.
 
-    :param url: the proxy_url from ContainerManager.execute(..., run=False).
+    :param url: the proxy_url that ContainerManager.execute_session() gets
+        from Zun's execute API.
     :param stdout: a binary file object, such as an open file or
         io.BytesIO, that receives the command's standard output as it
         arrives. If None, the session discards the output.
