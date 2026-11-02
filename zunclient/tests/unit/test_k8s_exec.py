@@ -191,6 +191,12 @@ class ExecSessionTest(testtools.TestCase):
         self.assertRaises(k8s_exec.SessionError, session.wait, TIMEOUT)
         ws.sock.shutdown.assert_called_once_with(socket.SHUT_RDWR)
 
+    def test_with_block_closes_session(self):
+        ws = FakeWebSocket()
+        with k8s_exec.ExecSession(ws) as session:
+            self.assertIsInstance(session, k8s_exec.ExecSession)
+        ws.sock.shutdown.assert_called_once_with(socket.SHUT_RDWR)
+
     def test_send_splits_large_writes(self):
         ws = FakeWebSocket()
         session = k8s_exec.ExecSession(ws)

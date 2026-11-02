@@ -139,6 +139,12 @@ class ExecSession(object):
         except (OSError, websocket.WebSocketException) as e:
             raise exceptions.Disconnected(e)
 
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        self.close()
+
     def close(self, timeout=3):
         """End the session. The command keeps running if it hasn't exited.
 

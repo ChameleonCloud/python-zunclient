@@ -622,6 +622,7 @@ class ContainerManagerTest(testtools.TestCase):
 
     def _execute_run(self, connect, args, exit_code=0, **kwargs):
         session = connect.return_value
+        session.__enter__.return_value = session
         session.wait.return_value = exit_code
 
         def connect_and_run(url, stdout, stderr):
@@ -650,7 +651,8 @@ class ContainerManagerTest(testtools.TestCase):
         self.assertEqual(b'out\n', result.stdout)
         self.assertEqual(b'err\n', result.stderr)
         self.assertIn('returncode=3', repr(result))
-        self.assertEqual([mock.call.wait(), mock.call.close()],
+        self.assertEqual([mock.call.__enter__(), mock.call.wait(),
+                          mock.call.__exit__(None, None, None)],
                          connect.return_value.mock_calls)
 
     @mock.patch('zunclient.common.websocketclient.k8s_exec.connect')
@@ -682,10 +684,11 @@ class ContainerManagerTest(testtools.TestCase):
     @mock.patch('zunclient.common.websocketclient.k8s_exec.connect')
     def test_containers_execute_run_closes_on_error(self, connect):
         session = connect.return_value
+        session.__enter__.return_value = session
         session.wait.side_effect = k8s_exec.SessionError()
         self.assertRaises(k8s_exec.SessionError, self.mgr.execute_run,
                           CONTAINER1['id'], CONTAINER1['command'])
-        session.close.assert_called_once_with()
+        session.__exit__.assert_called_once()
 
     @mock.patch('zunclient.common.websocketclient.k8s_exec.connect')
     def test_containers_execute_run_sends_input_then_closes_stdin(self,
@@ -698,8 +701,9 @@ class ContainerManagerTest(testtools.TestCase):
                 'command': CONTAINER1['command'], 'run': False,
                 'interactive': True})),
             self.api.calls[0][1])
-        self.assertEqual([mock.call.send(b'data'), mock.call.close_stdin(),
-                          mock.call.wait(), mock.call.close()],
+        self.assertEqual([mock.call.__enter__(), mock.call.send(b'data'),
+                          mock.call.close_stdin(), mock.call.wait(),
+                          mock.call.__exit__(None, None, None)],
                          connect.return_value.mock_calls)
         self.assertEqual(0, result.returncode)
 
@@ -712,8 +716,10 @@ class ContainerManagerTest(testtools.TestCase):
                                    exit_code=2, input=b'data')
         self.assertEqual(2, result.returncode)
         self.assertEqual(b'err\n', result.stderr)
-        self.assertEqual([mock.call.send(b'data'), mock.call.wait(),
-                          mock.call.close()], session.mock_calls)
+        self.assertEqual([mock.call.__enter__(), mock.call.send(b'data'),
+                          mock.call.wait(),
+                          mock.call.__exit__(None, None, None)],
+                         session.mock_calls)
 
     @mock.patch('zunclient.common.websocketclient.k8s_exec.connect')
     def test_containers_execute_session_passes_output_files_to_connect(

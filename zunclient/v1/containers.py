@@ -221,26 +221,23 @@ class ContainerManager(base.Manager):
         :raises UnsupportedVersion: if input is given and the API version
             is below 1.42.
         """
-        # Only request stin when there is input. Preserves no-stdin behavior
+        # Only request stdin when there is input. Preserves no-stdin behavior
         # when versions < 1.42 are specified.
         stdin = None if input is None else PIPE
         stdout, stderr = io.BytesIO(), io.BytesIO()
-        session = self.execute_session(id, args, stdin=stdin, stdout=stdout,
-                                       stderr=stderr)
-        try:
+        with self.execute_session(id, args, stdin=stdin, stdout=stdout,
+                                  stderr=stderr) as session:
             if input is not None:
                 try:
                     session.send(input)
                     session.close_stdin()
                 except ws_exceptions.Disconnected:
-                    # Raised if the command exits before reading all of stdin,
-                    # which is normal behavior.
-                    # Other connection drops will raise SessionError instead.
-                    # Callers should check the exit code received from wait().
+                    # The command exited before reading all of its input, which
+                    # may be normal. Callers should always check the exit code
+                    # from wait(). Other causes of dropped connection will
+                    # still raise SessionError.
                     pass
             returncode = session.wait()
-        finally:
-            session.close()
         result = CommandResult(id, args, returncode, stdout.getvalue(),
                                stderr.getvalue())
         if check:
