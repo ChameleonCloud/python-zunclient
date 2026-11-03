@@ -276,7 +276,8 @@ class ContainerManager(base.Manager):
     def copy_to(self, id, src_path, dest_dir):
         """Copy a local file or directory into dest_dir in the container.
 
-        It runs tar in the container and holds the archive in memory.
+        It runs tar in the container and writes the archive to tar's stdin
+        while building it, so the upload size doesn't affect memory use.
 
         :raises CommandFailed: if tar in the container fails, for example
             because dest_dir doesn't exist.
@@ -286,13 +287,25 @@ class ContainerManager(base.Manager):
         # set arcname so /home/foo/data/ -> dest_dir/data instead of
         # dest_dir/home/foo/data
         arcname = os.path.basename(os.path.abspath(src_path))
-        data = io.BytesIO()
-        with tarfile.open(fileobj=data, mode='w') as tar:
-            tar.add(src_path, arcname=arcname)
         # -o: leave files owned by the container's user, instead of the
         # uid:gid on the source files. TODO(shermanm) make this configurable
-        self.execute_run(id, ['tar', 'xof', '-', '-C', dest_dir],
-                         input=data.getvalue(), check=True)
+        args = ['tar', 'xof', '-', '-C', dest_dir]
+        stdout, stderr = io.BytesIO(), io.BytesIO()
+        with self.execute_session(id, args, stdin=PIPE, stdout=stdout,
+                                  stderr=stderr) as session:
+            try:
+                with tarfile.open(fileobj=session.stdin, mode='w|',
+                                  bufsize=k8s_exec.MAX_MESSAGE_SIZE) as tar:
+                    tar.add(src_path, arcname=arcname)
+                session.stdin.close()
+            except BrokenPipeError:
+                # tar exited before reading the whole archive. wait() still
+                # returns tar's exit code, which check_returncode() reports.
+                pass
+            returncode = session.wait()
+        result = CommandResult(id, args, returncode, stdout.getvalue(),
+                               stderr.getvalue())
+        result.check_returncode()
 
     def execute_session(self, id, args, stdin=None, stdout=None, stderr=None):
         """Start a command in the container and return a k8s_exec.ExecSession.

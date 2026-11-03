@@ -1079,7 +1079,7 @@ class CopyFromTest(testtools.TestCase):
                           self.mgr.copy_from, '1234', 'f', self.dest)
 
 
-@mock.patch.object(containers.ContainerManager, 'execute_run')
+@mock.patch.object(containers.ContainerManager, 'execute_session')
 class CopyToTest(testtools.TestCase):
 
     def setUp(self):
@@ -1088,35 +1088,49 @@ class CopyToTest(testtools.TestCase):
         self.tmp = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, self.tmp)
 
-    def test_copy_to_tar_command(self, execute_run):
-        src = os.path.join(self.tmp, 'a.txt')
-        with open(src, 'w') as f:
-            f.write('hello')
-        self.mgr.copy_to('1234', src, 'dest_dir')
-        execute_run.assert_called_once_with(
-            '1234', ['tar', 'xof', '-', '-C', 'dest_dir'],
-            input=mock.ANY, check=True)
+    def session(self, execute_session, returncode=0):
+        session = execute_session.return_value
+        session.__enter__.return_value = session
+        session.wait.return_value = returncode
+        return session
 
-    def test_copy_to_arcname_is_file_name(self, execute_run):
+    def sent_archive(self, session):
+        """The archive that copy_to wrote to tar's stdin, as a TarFile."""
+        data = b''.join(c.args[0] for c in session.stdin.write.call_args_list)
+        return tarfile.open(fileobj=io.BytesIO(data))
+
+    def test_copy_to_tar_command(self, execute_session):
+        session = self.session(execute_session)
         src = os.path.join(self.tmp, 'a.txt')
         with open(src, 'w') as f:
             f.write('hello')
         self.mgr.copy_to('1234', src, 'dest_dir')
-        archive = execute_run.call_args.kwargs['input']
-        with tarfile.open(fileobj=io.BytesIO(archive)) as tar:
+        execute_session.assert_called_once_with(
+            '1234', ['tar', 'xof', '-', '-C', 'dest_dir'],
+            stdin=containers.PIPE, stdout=mock.ANY, stderr=mock.ANY)
+        session.stdin.close.assert_called_once_with()
+
+    def test_copy_to_arcname_is_file_name(self, execute_session):
+        session = self.session(execute_session)
+        src = os.path.join(self.tmp, 'a.txt')
+        with open(src, 'w') as f:
+            f.write('hello')
+        self.mgr.copy_to('1234', src, 'dest_dir')
+        with self.sent_archive(session) as tar:
             self.assertEqual(['a.txt'], tar.getnames())
 
-    def test_copy_to_arcname_ignores_trailing_slash(self, execute_run):
+    def test_copy_to_arcname_ignores_trailing_slash(self, execute_session):
+        session = self.session(execute_session)
         src = os.path.join(self.tmp, 'data')
         os.mkdir(src)
         with open(os.path.join(src, 'a.txt'), 'w') as f:
             f.write('hello')
         self.mgr.copy_to('1234', src + '/', 'dest_dir')
-        archive = execute_run.call_args.kwargs['input']
-        with tarfile.open(fileobj=io.BytesIO(archive)) as tar:
+        with self.sent_archive(session) as tar:
             self.assertEqual(['data', 'data/a.txt'], tar.getnames())
 
-    def test_copy_to_arcname_of_dot_is_directory_name(self, execute_run):
+    def test_copy_to_arcname_of_dot_is_directory_name(self, execute_session):
+        session = self.session(execute_session)
         src = os.path.join(self.tmp, 'data')
         os.mkdir(src)
         with open(os.path.join(src, 'a.txt'), 'w') as f:
@@ -1124,6 +1138,35 @@ class CopyToTest(testtools.TestCase):
         self.addCleanup(os.chdir, os.getcwd())
         os.chdir(src)
         self.mgr.copy_to('1234', '.', 'dest_dir')
-        archive = execute_run.call_args.kwargs['input']
-        with tarfile.open(fileobj=io.BytesIO(archive)) as tar:
+        with self.sent_archive(session) as tar:
             self.assertEqual(['data', 'data/a.txt'], tar.getnames())
+
+    def test_copy_to_writes_large_file_in_pieces(self, execute_session):
+        session = self.session(execute_session)
+        src = os.path.join(self.tmp, 'big')
+        content = os.urandom(3 * k8s_exec.MAX_MESSAGE_SIZE)
+        with open(src, 'wb') as f:
+            f.write(content)
+        self.mgr.copy_to('1234', src, 'dest_dir')
+        sizes = [len(c.args[0]) for c in session.stdin.write.call_args_list]
+        self.assertGreater(len(sizes), 3)
+        self.assertLessEqual(max(sizes), k8s_exec.MAX_MESSAGE_SIZE)
+        with self.sent_archive(session) as tar:
+            self.assertEqual(content, tar.extractfile('big').read())
+
+    def test_copy_to_tar_failure_raises(self, execute_session):
+        self.session(execute_session, returncode=2)
+        src = os.path.join(self.tmp, 'a.txt')
+        open(src, 'w').close()
+        e = self.assertRaises(exceptions.CommandFailed,
+                              self.mgr.copy_to, '1234', src, 'dest_dir')
+        self.assertEqual(2, e.returncode)
+
+    def test_copy_to_tar_exiting_early_raises(self, execute_session):
+        session = self.session(execute_session, returncode=2)
+        session.stdin.write.side_effect = BrokenPipeError()
+        src = os.path.join(self.tmp, 'a.txt')
+        open(src, 'w').close()
+        e = self.assertRaises(exceptions.CommandFailed,
+                              self.mgr.copy_to, '1234', src, 'dest_dir')
+        self.assertEqual(2, e.returncode)
