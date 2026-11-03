@@ -38,6 +38,8 @@ CLOSE = 255  # The payload is the channel to close.
 
 MAX_MESSAGE_SIZE = 64 * 1024
 
+PIPE = -1  # Like subprocess.PIPE.
+
 
 class SessionError(exceptions.ContainerWebSocketException):
     """The session ended without the command's exit code.
@@ -68,25 +70,33 @@ class ExecTimeout(exceptions.ContainerWebSocketException):
                     % timeout)
 
 
-def connect(url, stdout=None, stderr=None):
+def connect(url, stdin=None, stdout=None, stderr=None):
     """Connect to Zun's websocket proxy, which then starts the remote command.
 
     :param url: the proxy_url that ContainerManager.execute_session() gets
         from Zun's execute API.
+    :param stdin: PIPE if the command was started with stdin, so that
+        session.stdin writes to it; otherwise None.
     :param stdout: a binary file object, such as an open file or
         io.BytesIO, that receives the command's standard output as it
         arrives. If None, the session discards the output.
     :param stderr: the same, for standard error.
     """
     ws = websocket.create_connection(url, subprotocols=[V5_PROTOCOL])
-    return ExecSession(ws, stdout=stdout, stderr=stderr)
+    return ExecSession(ws, stdin=stdin, stdout=stdout, stderr=stderr)
 
 
 class ExecSession(object):
-    """A connection to a command running in a container."""
+    """A connection to a command running in a container.
 
-    def __init__(self, ws, stdout=None, stderr=None):
+    :ivar stdin: with stdin=PIPE, a binary file object whose write() sends
+        to the command's stdin and whose close() ends the command's input,
+        like subprocess.Popen.stdin. Otherwise None.
+    """
+
+    def __init__(self, ws, stdin=None, stdout=None, stderr=None):
         self._ws = ws
+        self.stdin = _StdinFile(ws) if stdin == PIPE else None
         files = {STDOUT: stdout, STDERR: stderr}
         self._exit_code = futures.Future()
         self._reader = threading.Thread(target=self._read, args=(files,),
@@ -117,28 +127,6 @@ class ExecSession(object):
             raise ExecTimeout(timeout)
         return self._exit_code.result()
 
-    def send(self, data):
-        """Write bytes to the command's stdin.
-
-        :raises exceptions.Disconnected: if the connection has closed.
-        """
-        view = memoryview(data)
-        for start in range(0, len(view), MAX_MESSAGE_SIZE):
-            self._send(STDIN, view[start:start + MAX_MESSAGE_SIZE])
-
-    def close_stdin(self):
-        """Close the command's stdin, so the command sees the end of input.
-
-        :raises exceptions.Disconnected: if the connection has closed.
-        """
-        self._send(CLOSE, bytes([STDIN]))
-
-    def _send(self, channel, payload):
-        try:
-            self._ws.send_binary(bytes([channel]) + bytes(payload))
-        except (OSError, websocket.WebSocketException) as e:
-            raise exceptions.Disconnected(e)
-
     def __enter__(self):
         return self
 
@@ -167,6 +155,37 @@ class ExecSession(object):
                 sock.shutdown(socket.SHUT_RDWR)
             except OSError:
                 pass
+
+
+class _StdinFile(object):
+    """The command's stdin, as a binary file object."""
+
+    def __init__(self, ws):
+        self._ws = ws
+
+    def write(self, data):
+        """Send data to the command's stdin.
+
+        :raises BrokenPipeError: if the connection has closed, for example
+            because the command exited.
+        """
+        view = memoryview(data)
+        for start in range(0, len(view), MAX_MESSAGE_SIZE):
+            self._send(STDIN, view[start:start + MAX_MESSAGE_SIZE])
+        return len(view)
+
+    def close(self):
+        """End the command's input.
+
+        :raises BrokenPipeError: if the connection has closed.
+        """
+        self._send(CLOSE, bytes([STDIN]))
+
+    def _send(self, channel, payload):
+        try:
+            self._ws.send_binary(bytes([channel]) + bytes(payload))
+        except (OSError, websocket.WebSocketException) as e:
+            raise BrokenPipeError(str(e)) from e
 
 
 def _read_until_exit(ws, files):

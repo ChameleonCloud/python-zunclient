@@ -22,7 +22,6 @@ from urllib import parse
 from zunclient import api_versions
 from zunclient.common import base
 from zunclient.common import utils
-from zunclient.common.websocketclient import exceptions as ws_exceptions
 from zunclient.common.websocketclient import k8s_exec
 from zunclient import exceptions
 
@@ -36,7 +35,7 @@ CREATION_ATTRIBUTES = ['name', 'image', 'command', 'cpu', 'memory',
                        'exposed_ports', 'healthcheck', 'registry', 'tty',
                        'host', 'device_profiles', 'entrypoint']
 
-PIPE = -1  # Like subprocess.PIPE.
+PIPE = k8s_exec.PIPE
 
 
 class CommandResult(object):
@@ -229,9 +228,9 @@ class ContainerManager(base.Manager):
                                   stderr=stderr) as session:
             if input is not None:
                 try:
-                    session.send(input)
-                    session.close_stdin()
-                except ws_exceptions.Disconnected:
+                    session.stdin.write(input)
+                    session.stdin.close()
+                except BrokenPipeError:
                     # The command exited before reading all of its input, which
                     # may be normal. Callers should always check the exit code
                     # from wait(). Other causes of dropped connection will
@@ -300,8 +299,8 @@ class ContainerManager(base.Manager):
 
         :param args: a list of arguments, or a command line.
         :param stdin: PIPE to give the command a stdin, or None. The caller
-            writes to stdin with session.send() and closes it with
-            session.close_stdin().
+            writes to it with session.stdin.write() and ends it with
+            session.stdin.close().
         :param stdout: a binary file object that receives the command's
             standard output, or None to discard it.
         :param stderr: the same, for standard error.
@@ -327,8 +326,8 @@ class ContainerManager(base.Manager):
         # Instead of running when the REST API returns, the command begins
         # execution when the websocket connects.
         response = self._action(id, '/execute', qparams=qparams)[1]
-        return k8s_exec.connect(response['proxy_url'], stdout=stdout,
-                                stderr=stderr)
+        return k8s_exec.connect(response['proxy_url'], stdin=stdin,
+                                stdout=stdout, stderr=stderr)
 
     def _process_execute_tty(self, kwargs):
         tty_microversion = api_versions.APIVersion("1.42")

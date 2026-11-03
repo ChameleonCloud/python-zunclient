@@ -23,7 +23,6 @@ from testtools import matchers
 from urllib import parse
 from zunclient import api_versions
 from zunclient.common import utils as zun_utils
-from zunclient.common.websocketclient import exceptions as ws_exceptions
 from zunclient.common.websocketclient import k8s_exec
 from zunclient import exceptions
 from zunclient.tests.unit import utils
@@ -625,7 +624,7 @@ class ContainerManagerTest(testtools.TestCase):
         session.__enter__.return_value = session
         session.wait.return_value = exit_code
 
-        def connect_and_run(url, stdout, stderr):
+        def connect_and_run(url, stdin, stdout, stderr):
             stdout.write(b'out\n')
             stderr.write(b'err\n')
             return session
@@ -645,7 +644,8 @@ class ContainerManagerTest(testtools.TestCase):
         ]
         self.assertEqual(expect, self.api.calls)
         connect.assert_called_once_with('ws://proxy.example:6784/?token=t',
-                                        stdout=mock.ANY, stderr=mock.ANY)
+                                        stdin=None, stdout=mock.ANY,
+                                        stderr=mock.ANY)
         self.assertEqual(CONTAINER1['command'], result.args)
         self.assertEqual(3, result.returncode)
         self.assertEqual(b'out\n', result.stdout)
@@ -701,8 +701,9 @@ class ContainerManagerTest(testtools.TestCase):
                 'command': CONTAINER1['command'], 'run': False,
                 'interactive': True})),
             self.api.calls[0][1])
-        self.assertEqual([mock.call.__enter__(), mock.call.send(b'data'),
-                          mock.call.close_stdin(), mock.call.wait(),
+        self.assertEqual([mock.call.__enter__(),
+                          mock.call.stdin.write(b'data'),
+                          mock.call.stdin.close(), mock.call.wait(),
                           mock.call.__exit__(None, None, None)],
                          connect.return_value.mock_calls)
         self.assertEqual(0, result.returncode)
@@ -711,24 +712,26 @@ class ContainerManagerTest(testtools.TestCase):
     def test_containers_execute_run_returns_result_on_broken_pipe(self,
                                                                   connect):
         session = connect.return_value
-        session.send.side_effect = ws_exceptions.Disconnected()
+        session.stdin.write.side_effect = BrokenPipeError()
         result = self._execute_run(connect, CONTAINER1['command'],
                                    exit_code=2, input=b'data')
         self.assertEqual(2, result.returncode)
         self.assertEqual(b'err\n', result.stderr)
-        self.assertEqual([mock.call.__enter__(), mock.call.send(b'data'),
-                          mock.call.wait(),
+        self.assertEqual([mock.call.__enter__(),
+                          mock.call.stdin.write(b'data'), mock.call.wait(),
                           mock.call.__exit__(None, None, None)],
                          session.mock_calls)
 
     @mock.patch('zunclient.common.websocketclient.k8s_exec.connect')
-    def test_containers_execute_session_passes_output_files_to_connect(
+    def test_containers_execute_session_passes_stdin_and_files_to_connect(
             self, connect):
         stdout, stderr = io.BytesIO(), io.BytesIO()
         session = self.mgr.execute_session(CONTAINER1['id'],
                                            CONTAINER1['command'],
+                                           stdin=containers.PIPE,
                                            stdout=stdout, stderr=stderr)
         connect.assert_called_once_with('ws://proxy.example:6784/?token=t',
+                                        stdin=containers.PIPE,
                                         stdout=stdout, stderr=stderr)
         self.assertIs(connect.return_value, session)
 

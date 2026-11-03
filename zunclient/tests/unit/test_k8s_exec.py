@@ -19,7 +19,6 @@ from unittest import mock
 import testtools
 import websocket
 
-from zunclient.common.websocketclient import exceptions
 from zunclient.common.websocketclient import k8s_exec
 
 
@@ -197,26 +196,32 @@ class ExecSessionTest(testtools.TestCase):
             self.assertIsInstance(session, k8s_exec.ExecSession)
         ws.sock.shutdown.assert_called_once_with(socket.SHUT_RDWR)
 
-    def test_send_splits_large_writes(self):
-        ws = FakeWebSocket()
-        session = k8s_exec.ExecSession(ws)
+    def test_no_stdin_without_pipe(self):
+        session = k8s_exec.ExecSession(FakeWebSocket())
         self.addCleanup(session.close, timeout=0)
-        session.send(b'a' * k8s_exec.MAX_MESSAGE_SIZE + b'b')
+        self.assertIsNone(session.stdin)
+
+    def test_stdin_write_splits_large_writes(self):
+        ws = FakeWebSocket()
+        session = k8s_exec.ExecSession(ws, stdin=k8s_exec.PIPE)
+        self.addCleanup(session.close, timeout=0)
+        data = b'a' * k8s_exec.MAX_MESSAGE_SIZE + b'b'
+        self.assertEqual(len(data), session.stdin.write(data))
         self.assertEqual([b'\x00' + b'a' * k8s_exec.MAX_MESSAGE_SIZE,
                           b'\x00b'], ws.sent)
 
-    def test_close_stdin(self):
+    def test_stdin_close(self):
         ws = FakeWebSocket()
-        session = k8s_exec.ExecSession(ws)
+        session = k8s_exec.ExecSession(ws, stdin=k8s_exec.PIPE)
         self.addCleanup(session.close, timeout=0)
-        session.close_stdin()
+        session.stdin.close()
         self.assertEqual([b'\xff\x00'], ws.sent)
 
-    def test_send_after_connection_closed_raises(self):
+    def test_stdin_write_after_connection_closed_raises(self):
         for error in (websocket.WebSocketConnectionClosedException('closed'),
-                      BrokenPipeError(32, 'Broken pipe')):
+                      ConnectionResetError(104, 'Connection reset')):
             ws = FakeWebSocket()
             ws.send_binary = mock.Mock(side_effect=error)
-            session = k8s_exec.ExecSession(ws)
+            session = k8s_exec.ExecSession(ws, stdin=k8s_exec.PIPE)
             self.addCleanup(session.close, timeout=0)
-            self.assertRaises(exceptions.Disconnected, session.send, b'x')
+            self.assertRaises(BrokenPipeError, session.stdin.write, b'x')
