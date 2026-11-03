@@ -13,6 +13,7 @@
 #    under the License.
 
 import io
+import os
 import posixpath
 import shlex
 import tarfile
@@ -33,6 +34,8 @@ CREATION_ATTRIBUTES = ['name', 'image', 'command', 'cpu', 'memory',
                        'availability_zone', 'auto_heal', 'privileged',
                        'exposed_ports', 'healthcheck', 'registry', 'tty',
                        'host', 'device_profiles', 'entrypoint']
+
+PIPE = k8s_exec.PIPE
 
 
 class CommandResult(object):
@@ -204,23 +207,43 @@ class ContainerManager(base.Manager):
         return self._action(id, '/execute',
                             qparams=kwargs)[1]
 
-    def execute_run(self, id, args, check=False):
+    def execute_run(self, id, args, check=False, input=None):
         """Run a command in the container and wait for it to exit.
-
-        There is no timeout.
 
         :param args: a list of arguments, or a command line (no shell).
         :param check: if True, raise CommandFailed on a nonzero exit code.
+        :param input: bytes to write to the command's stdin, or a function
+            that takes the command's stdin as a binary file object and
+            writes to it. execute_run closes stdin afterwards. If None, the
+            command has no stdin.
         :returns: a CommandResult, with stdout and stderr as bytes.
         :raises k8s_exec.SessionError: if the session ended without the
             command's exit code, including when the program doesn't exist.
+        :raises UnsupportedVersion: if input is given and the API version
+            is below 1.42.
         """
-        session = self._exec_session(id, args)
-        try:
-            stdout, stderr = session.read_all()
-        finally:
-            session.close()
-        result = CommandResult(id, args, session.exit_code, stdout, stderr)
+        # Only request stdin when there is input. Preserves no-stdin behavior
+        # when versions < 1.42 are specified.
+        stdin = None if input is None else PIPE
+        stdout, stderr = io.BytesIO(), io.BytesIO()
+        with self.execute_session(id, args, stdin=stdin, stdout=stdout,
+                                  stderr=stderr) as session:
+            if input is not None:
+                try:
+                    if callable(input):
+                        input(session.stdin)
+                    else:
+                        session.stdin.write(input)
+                    session.stdin.close()
+                except BrokenPipeError:
+                    # The command exited before reading all of its input, which
+                    # may be normal. Callers should always check the exit code
+                    # from wait(). Other causes of dropped connection will
+                    # still raise SessionError.
+                    pass
+            returncode = session.wait()
+        result = CommandResult(id, args, returncode, stdout.getvalue(),
+                               stderr.getvalue())
         if check:
             result.check_returncode()
         return result
@@ -238,8 +261,10 @@ class ContainerManager(base.Manager):
             extracted then.
         """
         parent, name = posixpath.split(posixpath.normpath(src_path))
+        # "./" keeps a name that starts with "-" from being read as a tar
+        # option.
         result = self.execute_run(
-            id, ['tar', 'cf', '-', '-C', parent or '.', name or '.'],
+            id, ['tar', 'cf', '-', '-C', parent or '.', './' + (name or '.')],
             check=True)
         with tarfile.open(fileobj=io.BytesIO(result.stdout)) as tar:
             tar.getmembers()
@@ -253,17 +278,65 @@ class ContainerManager(base.Manager):
                     "damaged" % (src_path, id))
             tar.extractall(dest_dir, filter=_copy_from_filter)
 
-    def _exec_session(self, id, args):
-        """Start a command over a websocket; return its ExecSession."""
+    def copy_to(self, id, src_path, dest_dir):
+        """Copy a local file or directory into dest_dir in the container.
+
+        It runs tar in the container and writes the archive to tar's stdin
+        while building it, so the upload size doesn't affect memory use.
+
+        :raises CommandFailed: if tar in the container fails, for example
+            because dest_dir doesn't exist.
+        """
+
+        # tar creates each file's archive name under dest_dir
+        # set arcname so /home/foo/data/ -> dest_dir/data instead of
+        # dest_dir/home/foo/data
+        arcname = os.path.basename(os.path.abspath(src_path))
+
+        def write_archive(stdin):
+            with tarfile.open(fileobj=stdin, mode='w|',
+                              bufsize=k8s_exec.MAX_MESSAGE_SIZE) as tar:
+                tar.add(src_path, arcname=arcname)
+
+        # -o: leave files owned by the container's user, instead of the
+        # uid:gid on the source files. TODO(shermanm) make this configurable
+        self.execute_run(id, ['tar', 'xof', '-', '-C', dest_dir],
+                         input=write_archive, check=True)
+
+    def execute_session(self, id, args, stdin=None, stdout=None, stderr=None):
+        """Start a command in the container and return a k8s_exec.ExecSession.
+
+        :param args: a list of arguments, or a command line.
+        :param stdin: PIPE to give the command a stdin, or None. The caller
+            writes to it with session.stdin.write() and ends it with
+            session.stdin.close().
+        :param stdout: a binary file object that receives the command's
+            standard output, or None to discard it.
+        :param stderr: the same, for standard error.
+        :raises UnsupportedVersion: if stdin is PIPE and the API version is
+            below 1.42.
+        """
         command = args
         if not isinstance(command, str):
             # The server splits the command with shlex.split, which undoes
             # shlex.join exactly.
             command = shlex.join(command)
+        qparams = {'command': command, 'run': False}
+        if stdin == PIPE:
+            if self.api_version < api_versions.APIVersion("1.42"):
+                # Before 1.42, interactive=True also gives the command a
+                # terminal.
+                raise exceptions.UnsupportedVersion(
+                    f"API version {self.api_version.get_string()} can't give "
+                    "a command stdin without a terminal. Use API version "
+                    "1.42 or later."
+                )
+            qparams['interactive'] = True
         # Instead of running when the REST API returns, the command begins
         # execution when the websocket connects.
-        response = self.execute(id, command=command, run=False)
-        return k8s_exec.connect(response['proxy_url'])
+        response = self._action(id, '/execute', qparams=qparams)[1]
+        return k8s_exec.connect(response['proxy_url'], stdin=stdin,
+                                stdout=stdout, stderr=stderr)
 
     def _process_execute_tty(self, kwargs):
         tty_microversion = api_versions.APIVersion("1.42")

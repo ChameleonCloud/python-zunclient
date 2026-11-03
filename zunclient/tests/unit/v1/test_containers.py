@@ -251,6 +251,16 @@ fake_responses = {
         ),
     },
     '/v1/containers/%s/execute?%s'
+    % (CONTAINER1['id'], parse.urlencode({'command': CONTAINER1['command'],
+                                          'run': False,
+                                          'interactive': True})):
+    {
+        'POST': (
+            {},
+            {'proxy_url': 'ws://proxy.example:6784/?token=t'},
+        ),
+    },
+    '/v1/containers/%s/execute?%s'
     % (CONTAINER1['id'], parse.urlencode({'command': "sh -c 'echo hello'",
                                           'run': False})):
     {
@@ -611,8 +621,14 @@ class ContainerManagerTest(testtools.TestCase):
 
     def _execute_run(self, connect, args, exit_code=0, **kwargs):
         session = connect.return_value
-        session.read_all.return_value = (b'out\n', b'err\n')
-        session.exit_code = exit_code
+        session.__enter__.return_value = session
+        session.wait.return_value = exit_code
+
+        def connect_and_run(url, stdin, stdout, stderr):
+            stdout.write(b'out\n')
+            stderr.write(b'err\n')
+            return session
+        connect.side_effect = connect_and_run
         return self.mgr.execute_run(CONTAINER1['id'], args, **kwargs)
 
     @mock.patch('zunclient.common.websocketclient.k8s_exec.connect')
@@ -627,13 +643,17 @@ class ContainerManagerTest(testtools.TestCase):
              {'Content-Length': '0'}, None)
         ]
         self.assertEqual(expect, self.api.calls)
-        connect.assert_called_once_with('ws://proxy.example:6784/?token=t')
+        connect.assert_called_once_with('ws://proxy.example:6784/?token=t',
+                                        stdin=None, stdout=mock.ANY,
+                                        stderr=mock.ANY)
         self.assertEqual(CONTAINER1['command'], result.args)
         self.assertEqual(3, result.returncode)
         self.assertEqual(b'out\n', result.stdout)
         self.assertEqual(b'err\n', result.stderr)
         self.assertIn('returncode=3', repr(result))
-        connect.return_value.close.assert_called_once_with()
+        self.assertEqual([mock.call.__enter__(), mock.call.wait(),
+                          mock.call.__exit__(None, None, None)],
+                         connect.return_value.mock_calls)
 
     @mock.patch('zunclient.common.websocketclient.k8s_exec.connect')
     def test_containers_execute_run_list(self, connect):
@@ -656,7 +676,7 @@ class ContainerManagerTest(testtools.TestCase):
         self.assertEqual(b'err\n', e.stderr)
         self.assertEqual(
             "Command 'sh -c \"echo hello\"' in container 1234 returned "
-            "non-zero exit status 3", str(e))
+            "non-zero exit status 3: err", str(e))
         result = self._execute_run(connect, CONTAINER1['command'],
                                    check=True)
         self.assertEqual(0, result.returncode)
@@ -664,10 +684,83 @@ class ContainerManagerTest(testtools.TestCase):
     @mock.patch('zunclient.common.websocketclient.k8s_exec.connect')
     def test_containers_execute_run_closes_on_error(self, connect):
         session = connect.return_value
-        session.read_all.side_effect = k8s_exec.SessionError()
+        session.__enter__.return_value = session
+        session.wait.side_effect = k8s_exec.SessionError()
         self.assertRaises(k8s_exec.SessionError, self.mgr.execute_run,
                           CONTAINER1['id'], CONTAINER1['command'])
-        session.close.assert_called_once_with()
+        session.__exit__.assert_called_once()
+
+    @mock.patch('zunclient.common.websocketclient.k8s_exec.connect')
+    def test_containers_execute_run_sends_input_then_closes_stdin(self,
+                                                                  connect):
+        result = self._execute_run(connect, CONTAINER1['command'],
+                                   input=b'data')
+        self.assertEqual(
+            '/v1/containers/%s/execute?%s'
+            % (CONTAINER1['id'], parse.urlencode({
+                'command': CONTAINER1['command'], 'run': False,
+                'interactive': True})),
+            self.api.calls[0][1])
+        self.assertEqual([mock.call.__enter__(),
+                          mock.call.stdin.write(b'data'),
+                          mock.call.stdin.close(), mock.call.wait(),
+                          mock.call.__exit__(None, None, None)],
+                         connect.return_value.mock_calls)
+        self.assertEqual(0, result.returncode)
+
+    @mock.patch('zunclient.common.websocketclient.k8s_exec.connect')
+    def test_containers_execute_run_input_function_writes_to_stdin(self,
+                                                                   connect):
+        def write_input(stdin):
+            stdin.write(b'da')
+            stdin.write(b'ta')
+
+        self._execute_run(connect, CONTAINER1['command'], input=write_input)
+        self.assertEqual([mock.call.__enter__(),
+                          mock.call.stdin.write(b'da'),
+                          mock.call.stdin.write(b'ta'),
+                          mock.call.stdin.close(), mock.call.wait(),
+                          mock.call.__exit__(None, None, None)],
+                         connect.return_value.mock_calls)
+
+    @mock.patch('zunclient.common.websocketclient.k8s_exec.connect')
+    def test_containers_execute_run_returns_result_on_broken_pipe(self,
+                                                                  connect):
+        session = connect.return_value
+        session.stdin.write.side_effect = BrokenPipeError()
+        result = self._execute_run(connect, CONTAINER1['command'],
+                                   exit_code=2, input=b'data')
+        self.assertEqual(2, result.returncode)
+        self.assertEqual(b'err\n', result.stderr)
+        self.assertEqual([mock.call.__enter__(),
+                          mock.call.stdin.write(b'data'), mock.call.wait(),
+                          mock.call.__exit__(None, None, None)],
+                         session.mock_calls)
+
+    @mock.patch('zunclient.common.websocketclient.k8s_exec.connect')
+    def test_containers_execute_session_passes_stdin_and_files_to_connect(
+            self, connect):
+        stdout, stderr = io.BytesIO(), io.BytesIO()
+        session = self.mgr.execute_session(CONTAINER1['id'],
+                                           CONTAINER1['command'],
+                                           stdin=containers.PIPE,
+                                           stdout=stdout, stderr=stderr)
+        connect.assert_called_once_with('ws://proxy.example:6784/?token=t',
+                                        stdin=containers.PIPE,
+                                        stdout=stdout, stderr=stderr)
+        self.assertIs(connect.return_value, session)
+
+    @mock.patch('zunclient.common.websocketclient.k8s_exec.connect')
+    def test_containers_execute_session_refuses_stdin_before_1_42(
+            self, connect):
+        self.api.api_version = api_versions.APIVersion('1.41')
+        e = self.assertRaises(exceptions.UnsupportedVersion,
+                              self.mgr.execute_session, CONTAINER1['id'],
+                              'sh', stdin=containers.PIPE)
+        self.assertIn("API version 1.41 can't give a command stdin "
+                      "without a terminal", str(e))
+        self.assertEqual([], self.api.calls)
+        connect.assert_not_called()
 
     def _execute_url(self, **qparams):
         return '/v1/containers/%s/execute?%s' % (CONTAINER1['id'],
@@ -924,7 +1017,7 @@ class CopyFromTest(testtools.TestCase):
             member('data/bin', type=tarfile.SYMTYPE, linkname='/usr/bin'))
         self.mgr.copy_from('1234', '/srv/data/', self.dest)
         execute_run.assert_called_once_with(
-            '1234', ['tar', 'cf', '-', '-C', '/srv', 'data'], check=True)
+            '1234', ['tar', 'cf', '-', '-C', '/srv', './data'], check=True)
         data = os.path.join(self.dest, 'data')
         with open(os.path.join(data, 'a.txt'), 'rb') as f:
             self.assertEqual(b'hello\n', f.read())
@@ -936,7 +1029,15 @@ class CopyFromTest(testtools.TestCase):
         self.archive(execute_run)
         self.mgr.copy_from('1234', '/', self.dest)
         execute_run.assert_called_once_with(
-            '1234', ['tar', 'cf', '-', '-C', '/', '.'], check=True)
+            '1234', ['tar', 'cf', '-', '-C', '/', './.'], check=True)
+
+    def test_copy_from_name_starting_with_dash(self, execute_run):
+        self.archive(execute_run, member('-data', b'x'))
+        self.mgr.copy_from('1234', '/srv/-data', self.dest)
+        execute_run.assert_called_once_with(
+            '1234', ['tar', 'cf', '-', '-C', '/srv', './-data'], check=True)
+        with open(os.path.join(self.dest, '-data'), 'rb') as f:
+            self.assertEqual(b'x', f.read())
 
     def test_copy_from_refuses_path_outside_dest(self, execute_run):
         self.archive(execute_run, member('../escape.txt', b'x'))
@@ -991,3 +1092,96 @@ class CopyFromTest(testtools.TestCase):
             '1234', [], 0, data[:3000], b'')
         self.assertRaises(tarfile.ReadError,
                           self.mgr.copy_from, '1234', 'f', self.dest)
+
+
+@mock.patch.object(containers.ContainerManager, 'execute_session')
+class CopyToTest(testtools.TestCase):
+
+    def setUp(self):
+        super().setUp()
+        self.mgr = containers.ContainerManager(utils.FakeAPI({}))
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp)
+
+    def session(self, execute_session, returncode=0):
+        session = execute_session.return_value
+        session.__enter__.return_value = session
+        session.wait.return_value = returncode
+        return session
+
+    def sent_archive(self, session):
+        """The archive that copy_to wrote to tar's stdin, as a TarFile."""
+        data = b''.join(c.args[0] for c in session.stdin.write.call_args_list)
+        return tarfile.open(fileobj=io.BytesIO(data))
+
+    def test_copy_to_tar_command(self, execute_session):
+        session = self.session(execute_session)
+        src = os.path.join(self.tmp, 'a.txt')
+        with open(src, 'w') as f:
+            f.write('hello')
+        self.mgr.copy_to('1234', src, 'dest_dir')
+        execute_session.assert_called_once_with(
+            '1234', ['tar', 'xof', '-', '-C', 'dest_dir'],
+            stdin=containers.PIPE, stdout=mock.ANY, stderr=mock.ANY)
+        session.stdin.close.assert_called_once_with()
+
+    def test_copy_to_arcname_is_file_name(self, execute_session):
+        session = self.session(execute_session)
+        src = os.path.join(self.tmp, 'a.txt')
+        with open(src, 'w') as f:
+            f.write('hello')
+        self.mgr.copy_to('1234', src, 'dest_dir')
+        with self.sent_archive(session) as tar:
+            self.assertEqual(['a.txt'], tar.getnames())
+
+    def test_copy_to_arcname_ignores_trailing_slash(self, execute_session):
+        session = self.session(execute_session)
+        src = os.path.join(self.tmp, 'data')
+        os.mkdir(src)
+        with open(os.path.join(src, 'a.txt'), 'w') as f:
+            f.write('hello')
+        self.mgr.copy_to('1234', src + '/', 'dest_dir')
+        with self.sent_archive(session) as tar:
+            self.assertEqual(['data', 'data/a.txt'], tar.getnames())
+
+    def test_copy_to_arcname_of_dot_is_directory_name(self, execute_session):
+        session = self.session(execute_session)
+        src = os.path.join(self.tmp, 'data')
+        os.mkdir(src)
+        with open(os.path.join(src, 'a.txt'), 'w') as f:
+            f.write('hello')
+        self.addCleanup(os.chdir, os.getcwd())
+        os.chdir(src)
+        self.mgr.copy_to('1234', '.', 'dest_dir')
+        with self.sent_archive(session) as tar:
+            self.assertEqual(['data', 'data/a.txt'], tar.getnames())
+
+    def test_copy_to_writes_large_file_in_pieces(self, execute_session):
+        session = self.session(execute_session)
+        src = os.path.join(self.tmp, 'big')
+        content = os.urandom(3 * k8s_exec.MAX_MESSAGE_SIZE)
+        with open(src, 'wb') as f:
+            f.write(content)
+        self.mgr.copy_to('1234', src, 'dest_dir')
+        sizes = [len(c.args[0]) for c in session.stdin.write.call_args_list]
+        self.assertGreater(len(sizes), 3)
+        self.assertLessEqual(max(sizes), k8s_exec.MAX_MESSAGE_SIZE)
+        with self.sent_archive(session) as tar:
+            self.assertEqual(content, tar.extractfile('big').read())
+
+    def test_copy_to_tar_failure_raises(self, execute_session):
+        self.session(execute_session, returncode=2)
+        src = os.path.join(self.tmp, 'a.txt')
+        open(src, 'w').close()
+        e = self.assertRaises(exceptions.CommandFailed,
+                              self.mgr.copy_to, '1234', src, 'dest_dir')
+        self.assertEqual(2, e.returncode)
+
+    def test_copy_to_tar_exiting_early_raises(self, execute_session):
+        session = self.session(execute_session, returncode=2)
+        session.stdin.write.side_effect = BrokenPipeError()
+        src = os.path.join(self.tmp, 'a.txt')
+        open(src, 'w').close()
+        e = self.assertRaises(exceptions.CommandFailed,
+                              self.mgr.copy_to, '1234', src, 'dest_dir')
+        self.assertEqual(2, e.returncode)

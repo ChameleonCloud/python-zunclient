@@ -10,9 +10,16 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-"""Read a command's output and exit code from a Kubernetes exec session."""
+"""Run a command in a container over an exec session.
 
+Sessions use Kubernetes' remotecommand protocol, v5.channel.k8s.io,
+through Zun's websocket proxy.
+"""
+
+from concurrent import futures
 import json
+import socket
+import threading
 
 from oslo_log import log as logging
 import websocket
@@ -23,11 +30,15 @@ LOG = logging.getLogger(__name__)
 
 V5_PROTOCOL = 'v5.channel.k8s.io'
 
-# The first byte of each message says which channel it is on. ERROR carries
-# the command's result as a Kubernetes Status in JSON, sent for success too.
+STDIN = 0
 STDOUT = 1
 STDERR = 2
-ERROR = 3
+ERROR = 3   # JSON Status object, includes exit code for all commands.
+CLOSE = 255  # The payload is the channel to close.
+
+MAX_MESSAGE_SIZE = 64 * 1024
+
+PIPE = -1  # Like subprocess.PIPE.
 
 
 class SessionError(exceptions.ContainerWebSocketException):
@@ -49,32 +60,149 @@ class SessionError(exceptions.ContainerWebSocketException):
         super(SessionError, self).__init__(message=message)
 
 
-def connect(url):
-    """Start an exec session at the URL that containers.execute returned."""
+class ExecTimeout(exceptions.ContainerWebSocketException):
+    """Timeout while waiting for a command to complete."""
+
+    def __init__(self, timeout):
+        self.timeout = timeout
+        super(ExecTimeout, self).__init__(
+            message="The command was still running after %s seconds"
+                    % timeout)
+
+
+def connect(url, stdin=None, stdout=None, stderr=None):
+    """Connect to Zun's websocket proxy, which then starts the remote command.
+
+    :param url: the proxy_url that ContainerManager.execute_session() gets
+        from Zun's execute API.
+    :param stdin: PIPE if the command was started with stdin, so that
+        session.stdin writes to it; otherwise None.
+    :param stdout: a binary file object, such as an open file or
+        io.BytesIO, that receives the command's standard output as it
+        arrives. If None, the session discards the output.
+    :param stderr: the same, for standard error.
+    """
     ws = websocket.create_connection(url, subprotocols=[V5_PROTOCOL])
-    return ExecSession(ws)
+    return ExecSession(ws, stdin=stdin, stdout=stdout, stderr=stderr)
 
 
 class ExecSession(object):
-    """A command running in a container, read over a websocket."""
+    """A connection to a command running in a container.
+
+    :ivar stdin: with stdin=PIPE, a binary file object whose write() sends
+        to the command's stdin and whose close() ends the command's input,
+        like subprocess.Popen.stdin. Otherwise None.
+    """
+
+    def __init__(self, ws, stdin=None, stdout=None, stderr=None):
+        self._ws = ws
+        self.stdin = _StdinFile(ws) if stdin == PIPE else None
+        files = {STDOUT: stdout, STDERR: stderr}
+        self._exit_code = futures.Future()
+        self._reader = threading.Thread(target=self._read, args=(files,),
+                                        name='k8s-exec-reader', daemon=True)
+        self._reader.start()
+
+    def _read(self, files):
+        try:
+            exit_code = _read_until_exit(self._ws, files)
+        except BaseException as e:  # noqa: BLE001
+            # Every exception must reach wait(), or wait() blocks forever.
+            self._exit_code.set_exception(e)
+        else:
+            self._exit_code.set_result(exit_code)
+
+    def wait(self, timeout=None):
+        """Block until the command exits; return its exit code.
+
+        If writing the output raised an exception, wait() raises it.
+
+        :raises SessionError: if the session ended without the exit code.
+        :raises ExecTimeout: if the command is still running after timeout
+            seconds. The session is not closed: call wait() again, or
+            close().
+        """
+        _, not_done = futures.wait([self._exit_code], timeout)
+        if not_done:
+            raise ExecTimeout(timeout)
+        return self._exit_code.result()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        self.close()
+
+    def close(self, timeout=3):
+        """End the session. The command keeps running if it hasn't exited.
+
+        :param timeout: seconds to wait for the server to acknowledge the
+            close message.
+        """
+        if not self._exit_code.done():
+            try:
+                self._ws.send_close()
+            except (OSError, websocket.WebSocketException):
+                pass
+            futures.wait([self._exit_code], timeout)
+        # Shut down the underlying socket directly. ws.shutdown() doesn't wake 
+        # a thread blocked in recv_data(). We also can't use ws.close(), it 
+        # receives frames, and this method may be called from a non-reader 
+        # thread.
+        sock = self._ws.sock
+        if sock is not None:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+
+class _StdinFile(object):
+    """The command's stdin, as a binary file object."""
 
     def __init__(self, ws):
         self._ws = ws
-        self.exit_code = None
 
-    def read_all(self):
-        """Read to the end; return (stdout, stderr) and set exit_code.
+    def write(self, data):
+        """Send data to the command's stdin.
 
-        :raises SessionError: if the connection ended before the exit code
-            arrived.
+        :raises BrokenPipeError: if the connection has closed, for example
+            because the command exited.
         """
-        out, err, status, ended = [], [], None, None
+        view = memoryview(data)
+        for start in range(0, len(view), MAX_MESSAGE_SIZE):
+            self._send(STDIN, view[start:start + MAX_MESSAGE_SIZE])
+        return len(view)
+
+    def close(self):
+        """End the command's input.
+
+        :raises BrokenPipeError: if the connection has closed.
+        """
+        self._send(CLOSE, bytes([STDIN]))
+
+    def _send(self, channel, payload):
+        try:
+            self._ws.send_binary(bytes([channel]) + bytes(payload))
+        except (OSError, websocket.WebSocketException) as e:
+            raise BrokenPipeError(str(e)) from e
+
+
+def _read_until_exit(ws, files):
+    """Write the command's output to files until the connection ends.
+
+    Return the command's exit code. Close ws before returning or raising.
+
+    :param files: a dict that maps STDOUT and STDERR to binary files, or
+        to None to discard that output.
+    :raises SessionError: if the connection ended without the exit code.
+    """
+    status = None
+    try:
         while True:
             try:
-                opcode, data = self._ws.recv_data()
+                opcode, data = ws.recv_data()
             except (OSError, websocket.WebSocketException) as e:
-                # The connection was lost. If the exit code had already
-                # arrived, it is still the answer.
                 ended = repr(e)
                 break
             if opcode == websocket.ABNF.OPCODE_CLOSE:
@@ -83,23 +211,22 @@ class ExecSession(object):
             if not data:
                 continue
             channel, payload = data[0], data[1:]
-            if channel == STDOUT:
-                out.append(payload)
-            elif channel == STDERR:
-                err.append(payload)
+            if channel in (STDOUT, STDERR):
+                file = files[channel]
+                if file is not None and payload:
+                    file.write(payload)
+                    # Flush so that the output appears as soon as it arrives.
+                    file.flush()
             elif channel == ERROR:
                 status = _parse_status(payload)
-        self.exit_code = _exit_code(status)
-        if self.exit_code is None:
-            raise SessionError(status, ended)
-        return b''.join(out), b''.join(err)
-
-    def close(self):
-        """Close the session's websocket."""
-        try:
-            self._ws.close()
-        except (OSError, websocket.WebSocketException):
-            pass
+    finally:
+        # ws.close() does nothing once the server has closed the
+        # connection, so close the socket with ws.shutdown().
+        ws.shutdown()
+    exit_code = _exit_code(status)
+    if exit_code is None:
+        raise SessionError(status, ended)
+    return exit_code
 
 
 def _close_reason(data):
