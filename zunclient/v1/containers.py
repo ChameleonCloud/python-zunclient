@@ -212,7 +212,9 @@ class ContainerManager(base.Manager):
 
         :param args: a list of arguments, or a command line (no shell).
         :param check: if True, raise CommandFailed on a nonzero exit code.
-        :param input: bytes to write to the command's stdin. If None, the
+        :param input: bytes to write to the command's stdin, or a function
+            that takes the command's stdin as a binary file object and
+            writes to it. execute_run closes stdin afterwards. If None, the
             command has no stdin.
         :returns: a CommandResult, with stdout and stderr as bytes.
         :raises k8s_exec.SessionError: if the session ended without the
@@ -228,7 +230,10 @@ class ContainerManager(base.Manager):
                                   stderr=stderr) as session:
             if input is not None:
                 try:
-                    session.stdin.write(input)
+                    if callable(input):
+                        input(session.stdin)
+                    else:
+                        session.stdin.write(input)
                     session.stdin.close()
                 except BrokenPipeError:
                     # The command exited before reading all of its input, which
@@ -287,25 +292,16 @@ class ContainerManager(base.Manager):
         # set arcname so /home/foo/data/ -> dest_dir/data instead of
         # dest_dir/home/foo/data
         arcname = os.path.basename(os.path.abspath(src_path))
+
+        def write_archive(stdin):
+            with tarfile.open(fileobj=stdin, mode='w|',
+                              bufsize=k8s_exec.MAX_MESSAGE_SIZE) as tar:
+                tar.add(src_path, arcname=arcname)
+
         # -o: leave files owned by the container's user, instead of the
         # uid:gid on the source files. TODO(shermanm) make this configurable
-        args = ['tar', 'xof', '-', '-C', dest_dir]
-        stdout, stderr = io.BytesIO(), io.BytesIO()
-        with self.execute_session(id, args, stdin=PIPE, stdout=stdout,
-                                  stderr=stderr) as session:
-            try:
-                with tarfile.open(fileobj=session.stdin, mode='w|',
-                                  bufsize=k8s_exec.MAX_MESSAGE_SIZE) as tar:
-                    tar.add(src_path, arcname=arcname)
-                session.stdin.close()
-            except BrokenPipeError:
-                # tar exited before reading the whole archive. wait() still
-                # returns tar's exit code, which check_returncode() reports.
-                pass
-            returncode = session.wait()
-        result = CommandResult(id, args, returncode, stdout.getvalue(),
-                               stderr.getvalue())
-        result.check_returncode()
+        self.execute_run(id, ['tar', 'xof', '-', '-C', dest_dir],
+                         input=write_archive, check=True)
 
     def execute_session(self, id, args, stdin=None, stdout=None, stderr=None):
         """Start a command in the container and return a k8s_exec.ExecSession.

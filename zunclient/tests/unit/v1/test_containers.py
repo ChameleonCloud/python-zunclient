@@ -709,6 +709,21 @@ class ContainerManagerTest(testtools.TestCase):
         self.assertEqual(0, result.returncode)
 
     @mock.patch('zunclient.common.websocketclient.k8s_exec.connect')
+    def test_containers_execute_run_input_function_writes_to_stdin(self,
+                                                                   connect):
+        def write_input(stdin):
+            stdin.write(b'da')
+            stdin.write(b'ta')
+
+        self._execute_run(connect, CONTAINER1['command'], input=write_input)
+        self.assertEqual([mock.call.__enter__(),
+                          mock.call.stdin.write(b'da'),
+                          mock.call.stdin.write(b'ta'),
+                          mock.call.stdin.close(), mock.call.wait(),
+                          mock.call.__exit__(None, None, None)],
+                         connect.return_value.mock_calls)
+
+    @mock.patch('zunclient.common.websocketclient.k8s_exec.connect')
     def test_containers_execute_run_returns_result_on_broken_pipe(self,
                                                                   connect):
         session = connect.return_value
