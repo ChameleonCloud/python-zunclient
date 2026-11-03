@@ -84,6 +84,9 @@ class CommandFailed(exceptions.ClientException):
         self.returncode = returncode
         self.stdout = stdout
         self.stderr = stderr
-        super(CommandFailed, self).__init__(
-            "Command %r in container %s returned non-zero exit status %d"
-            % (cmd, container, returncode))
+        message = ("Command %r in container %s returned non-zero exit "
+                   "status %d" % (cmd, container, returncode))
+        detail = stderr.decode(errors='replace').strip()
+        if detail:
+            message += ": " + detail
+        super(CommandFailed, self).__init__(message)

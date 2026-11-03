@@ -676,7 +676,7 @@ class ContainerManagerTest(testtools.TestCase):
         self.assertEqual(b'err\n', e.stderr)
         self.assertEqual(
             "Command 'sh -c \"echo hello\"' in container 1234 returned "
-            "non-zero exit status 3", str(e))
+            "non-zero exit status 3: err", str(e))
         result = self._execute_run(connect, CONTAINER1['command'],
                                    check=True)
         self.assertEqual(0, result.returncode)
